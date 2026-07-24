@@ -277,22 +277,24 @@ jobs:
                       | del(.status)' \
                   | kubectl apply -f -
               else
-                cat <<EOF | kubectl apply -f -
-        apiVersion: cloudwatch.aws.amazon.com/v1alpha1
-        kind: Instrumentation
-        metadata:
-          name: adot-python-instrumentation
-          namespace: ${{ env.SAMPLE_APP_NAMESPACE }}
-        spec:
-          exporter:
-            endpoint: http://cloudwatch-agent.amazon-cloudwatch:4316/v1/metrics
-          propagators: [tracecontext, baggage, b3, xray]
-          sampler:
-            type: xray
-            argument: "endpoint=http://cloudwatch-agent.amazon-cloudwatch:2000"
-          python:
-            image: ${{ env.PATCH_IMAGE_ARN }}
-        EOF
+                # Build the CR YAML with printf (avoids heredoc indentation issues inside the
+                # YAML block scalar). \n keeps the applied manifest correctly un-indented.
+                printf '%s\n' \
+                  'apiVersion: cloudwatch.aws.amazon.com/v1alpha1' \
+                  'kind: Instrumentation' \
+                  'metadata:' \
+                  '  name: adot-python-instrumentation' \
+                  '  namespace: ${{ env.SAMPLE_APP_NAMESPACE }}' \
+                  'spec:' \
+                  '  exporter:' \
+                  '    endpoint: http://cloudwatch-agent.amazon-cloudwatch:4316/v1/metrics' \
+                  '  propagators: [tracecontext, baggage, b3, xray]' \
+                  '  sampler:' \
+                  '    type: xray' \
+                  '    argument: "endpoint=http://cloudwatch-agent.amazon-cloudwatch:2000"' \
+                  '  python:' \
+                  '    image: ${{ env.PATCH_IMAGE_ARN }}' \
+                  | kubectl apply -f -
               fi
               kubectl get instrumentation -n ${{ env.SAMPLE_APP_NAMESPACE }} -o yaml
 
