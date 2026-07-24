@@ -113,8 +113,10 @@ resource "kubernetes_deployment_v1" "python_app_deployment" {
           app = "python-app"
         }
         annotations = {
-          # these annotations allow for OTel Python instrumentation
-          "instrumentation.opentelemetry.io/inject-python" = "true"
+          # Reference this namespace's Instrumentation CR by name (created by the
+          # create_instrumentation_cr action) so the operator injects THIS test's ADOT image,
+          # instead of the operator's shared cluster-wide default. Enables parallel per-version tests.
+          "instrumentation.opentelemetry.io/inject-python" = "adot-python-instrumentation"
         }
       }
       spec {
@@ -204,8 +206,10 @@ resource "kubernetes_deployment_v1" "python_r_app_deployment" {
           app = "remote-app"
         }
         annotations = {
-          # these annotations allow for OTel Python instrumentation
-          "instrumentation.opentelemetry.io/inject-python" = "true"
+          # Reference this namespace's Instrumentation CR by name (created by the
+          # create_instrumentation_cr action) so the operator injects THIS test's ADOT image,
+          # instead of the operator's shared cluster-wide default. Enables parallel per-version tests.
+          "instrumentation.opentelemetry.io/inject-python" = "adot-python-instrumentation"
         }
       }
       spec {
