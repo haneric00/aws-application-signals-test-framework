@@ -1,0 +1,97 @@
+## Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+## SPDX-License-Identifier: Apache-2.0
+
+# Installs the cluster-wide amazon-cloudwatch-observability (Application Signals) addon ONCE,
+# before the per-version EKS test jobs fan out in parallel. The addon is a cluster singleton;
+# installing it per-version-job caused concurrent installs/deletes to race. Callers run this
+# as a bracket job that all version jobs depend on, and pair it with eks-cleanup-appsignals.yml
+# (if: always()) after the matrix completes.
+name: EKS Enable Application Signals
+
+on:
+  workflow_call:
+    inputs:
+      aws-region:
+        required: true
+        type: string
+      test-cluster-name:
+        required: true
+        type: string
+      caller-workflow-name:
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  E2E_TEST_AWS_REGION: ${{ inputs.aws-region }}
+  CLUSTER_NAME: ${{ inputs.test-cluster-name }}
+  E2E_TEST_ACCOUNT_ID: ${{ secrets.APPLICATION_SIGNALS_E2E_TEST_ACCOUNT_ID }}
+  E2E_TEST_ROLE_NAME: ${{ secrets.APPLICATION_SIGNALS_E2E_TEST_ROLE_NAME }}
+  LOG_GROUP_NAME: /aws/application-signals/data
+
+jobs:
+  enable-app-signals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: 'aws-observability/aws-application-signals-test-framework'
+          ref: ${{ inputs.caller-workflow-name == 'main-build' && 'EKS-test-fix' || github.ref }}
+          fetch-depth: 0
+
+      - name: Download enablement script
+        uses: ./.github/workflows/actions/execute_and_retry
+        with:
+          pre-command: "mkdir enablement-script && cd enablement-script"
+          command: "wget https://raw.githubusercontent.com/aws-observability/application-signals-demo/main/scripts/eks/appsignals/enable-app-signals.sh
+          && wget https://raw.githubusercontent.com/aws-observability/application-signals-demo/main/scripts/eks/appsignals/clean-app-signals.sh"
+          cleanup: "rm -f enable-app-signals.sh && rm -f clean-app-signals.sh"
+          post-command: "chmod +x enable-app-signals.sh && chmod +x clean-app-signals.sh"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@a03048d87541d1d9fcf2ecf528a4a65ba9bd7838 # v5.0.0
+        with:
+          role-to-assume: arn:aws:iam::${{ env.E2E_TEST_ACCOUNT_ID }}:role/${{ env.E2E_TEST_ROLE_NAME }}
+          aws-region: us-east-1
+
+      - name: Set up kubeconfig
+        run: aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.E2E_TEST_AWS_REGION }}
+
+      # The enable script's third arg (namespace) is only echoed — the addon is cluster-wide, so a
+      # placeholder is fine. Installing it here means every parallel version job shares one addon.
+      - name: Enable Application Signals on the cluster
+        uses: ./.github/workflows/actions/execute_and_retry
+        with:
+          command: "${GITHUB_WORKSPACE}/enablement-script/enable-app-signals.sh
+          ${{ env.CLUSTER_NAME }}
+          ${{ env.E2E_TEST_AWS_REGION }}
+          default"
+          max_retry: 3
+          sleep_time: 60
+
+      # The addon reaching ACTIVE does not guarantee the CloudWatch Agent operator's pods are Ready
+      # and its mutating webhook is serving. The version jobs rely on that webhook to inject
+      # instrumentation into their pods, so wait for the operator to be fully Available here —
+      # otherwise version pods can deploy UNINSTRUMENTED and telemetry validation fails.
+      - name: Wait for the Application Signals operator to be ready
+        run: |
+          # Wait until the amazon-cloudwatch namespace has at least one deployment (the addon may
+          # still be creating its workloads after reporting ACTIVE).
+          for i in $(seq 1 30); do
+            if [ -n "$(kubectl get deployments -n amazon-cloudwatch -o name 2>/dev/null)" ]; then
+              break
+            fi
+            echo "Waiting for amazon-cloudwatch workloads to appear... ($i/30)"
+            sleep 10
+          done
+          # Roll out status on every deployment in the namespace (operator + agent), then confirm all
+          # pods are Ready. This guarantees the injection webhook is live before version pods deploy —
+          # otherwise version pods can deploy UNINSTRUMENTED and telemetry validation fails.
+          for deploy in $(kubectl get deployments -n amazon-cloudwatch -o name); do
+            kubectl rollout status "$deploy" -n amazon-cloudwatch --timeout=300s
+          done
+          kubectl wait --for=condition=Ready pod --all -n amazon-cloudwatch --timeout=300s

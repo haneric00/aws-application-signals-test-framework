@@ -234,23 +234,15 @@ jobs:
 
             # If the deployment_failed is still 0, then the terraform deployment succeeded and now try to connect to the endpoint 
             # after installing Application Signals. Attempts to connect will be made for up to 10 minutes
-            if [ $deployment_failed -eq 0 ]; then          
-              echo "Installing application signals to the sample app"
+            if [ $deployment_failed -eq 0 ]; then
+              # Application Signals is enabled cluster-wide once by the enable-app-signals bracket
+              # job before this parallel matrix runs, so it is NOT installed here per-version.
+              # The addon's operator instruments this version's pods via their inject annotation.
               . ${{ env.TEST_RESOURCES_FOLDER }}/.github/workflows/util/execute_and_retry.sh
-              execute_and_retry 3 \
-              "${{ env.TEST_RESOURCES_FOLDER }}/enablement-script/enable-app-signals.sh \
-              ${{ inputs.test-cluster-name }} \
-              ${{ env.E2E_TEST_AWS_REGION }} \
-              ${{ env.SAMPLE_APP_NAMESPACE }}" \
-              "${{ env.TEST_RESOURCES_FOLDER }}/enablement-script/clean-app-signals.sh \
-              ${{ inputs.test-cluster-name }} \
-              ${{ env.E2E_TEST_AWS_REGION }} \
-              ${{ env.SAMPLE_APP_NAMESPACE }} && \
-              aws eks update-kubeconfig --name ${{ inputs.test-cluster-name }} --region ${{ env.E2E_TEST_AWS_REGION }}" \
-              60
-          
+
               aws eks update-kubeconfig --region ${{ env.E2E_TEST_AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
-                  
+
+              # Restart pods so the (already-installed) operator injects instrumentation into them.
               execute_and_retry 2 "kubectl delete pods --all -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 60
               execute_and_retry 2 "kubectl wait --for=condition=Ready --request-timeout '5m' pod --all -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 10
             fi
@@ -258,15 +250,10 @@ jobs:
             # If the deployment_failed is 1 then either the terraform deployment or the endpoint connection failed, so first destroy the
             # resources created from terraform and try again.
             if [ $deployment_failed -eq 1 ]; then
-              echo "Cleaning up Application Signal"
-              ${{ env.TEST_RESOURCES_FOLDER }}/enablement-script/clean-app-signals.sh \
-              ${{ env.CLUSTER_NAME }} \
-              ${{ env.E2E_TEST_AWS_REGION }} \
-              ${{ env.SAMPLE_APP_NAMESPACE }}
-
-              # Running clean-app-signal.sh removes the current cluster from the config. Update the cluster again for subsequent runs.
-              aws eks update-kubeconfig --name ${{ inputs.test-cluster-name }} --region ${{ env.E2E_TEST_AWS_REGION }}
-
+              # Do NOT run clean-app-signals.sh here: the Application Signals addon is cluster-wide and
+              # shared by the other parallel version jobs — deleting it would break them. Only tear down
+              # this version's own terraform resources. The shared addon is removed by the
+              # cleanup-app-signals bracket job after the whole matrix completes.
               echo "Destroying terraform"
               terraform destroy -auto-approve \
                 -var='python_version=${{ env.PYTHON_VERSION }}'\
@@ -429,22 +416,14 @@ jobs:
           fi
 
       # Clean up Procedures
+      # NOTE: The cluster-wide Application Signals addon is intentionally NOT cleaned up here — it is
+      # shared by the other parallel version jobs and is removed once by the cleanup-app-signals
+      # bracket job after the whole matrix completes. This job only removes its own namespace.
 
-      - name: Clean Up Application Signals
+      - name: Delete this version's sample app namespace
         if: always()
         continue-on-error: true
-        working-directory: enablement-script
-        run: |
-          ./clean-app-signals.sh \
-          ${{ inputs.test-cluster-name }} \
-          ${{ env.E2E_TEST_AWS_REGION }} \
-          ${{ env.SAMPLE_APP_NAMESPACE }}
-
-      # This step also deletes lingering resources from previous test runs
-      - name: Delete all sample app resources
-        if: always()
-        continue-on-error: true
-        run: kubectl delete namespace ${{ env.SAMPLE_APP_NAMESPACE }}
+        run: kubectl delete namespace ${{ env.SAMPLE_APP_NAMESPACE }} --ignore-not-found
 
       - name: Terraform destroy
         if: always()
