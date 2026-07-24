@@ -66,13 +66,8 @@ jobs:
 
       - name: Generate testing id and python sample app namespace
         run: |
-          # Sanitize the python version for use in a Kubernetes namespace (DNS-1123: no dots).
-          PY_VERSION_SLUG="py$(echo '${{ env.PYTHON_VERSION }}' | tr -d '.')"
-          echo TESTING_ID="${{ github.job }}-${PY_VERSION_SLUG}-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}" >> "$GITHUB_ENV"
-          # Namespace must be unique per parallel version job. The reusable workflow's github.job
-          # is identical ("python-eks") across all version callers, so the python version slug is
-          # what disambiguates concurrent runs on the shared cluster.
-          echo SAMPLE_APP_NAMESPACE="ns-${PY_VERSION_SLUG}-${{ github.run_id }}-${{ github.run_number }}" >> "$GITHUB_ENV"
+          echo TESTING_ID="${{ github.job }}-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}" >> "$GITHUB_ENV"
+          echo SAMPLE_APP_NAMESPACE="ns-${{ github.run_id }}-${{ github.run_number }}" >> "$GITHUB_ENV"
           
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -153,13 +148,11 @@ jobs:
         run: |
           echo "${{ github.workspace }}/eksctl" >> "$GITHUB_PATH"
 
-      # Delete only THIS job's namespace from a prior run. Do NOT bulk-delete all ns-* namespaces:
-      # with version jobs running in parallel on the shared cluster, that would delete other
-      # concurrently-running jobs' namespaces mid-run.
-      - name: Delete this job's sample app namespace if it lingers
+      # This step deletes lingering resources from previous test runs
+      - name: Delete all sample app namespaces
         continue-on-error: true
         timeout-minutes: 5
-        run: kubectl delete namespace "${{ env.SAMPLE_APP_NAMESPACE }}" --ignore-not-found
+        run: kubectl get namespace | awk '/^ns-[0-9]+-[0-9]+/{print $1}' | xargs kubectl delete namespace
 
       - name: Create role for AWS access from the sample app
         id: create_service_account
