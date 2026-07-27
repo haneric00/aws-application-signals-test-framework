@@ -267,89 +267,69 @@ jobs:
               aws eks update-kubeconfig --region ${{ env.E2E_TEST_AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
 
               # enable-app-signals.sh returns as soon as the addon is *requested*, while the addon is
-              # still CREATING. The Instrumentation CRD is registered by the operator that the addon
-              # deploys, so it does not exist until the addon reaches ACTIVE (typically 2-5 min). We
-              # must wait for ACTIVE first — otherwise "server doesn't have a resource type
-              # instrumentation" / "no matches for kind Instrumentation".
-              # Note: kubectl wait on an absent CRD errors instantly ("no matching resources found"),
-              # so we cannot wait on the CRD directly until the addon is up. Poll addon status first.
+              # still CREATING. The operator (which performs injection) is deployed by the addon, so it
+              # is not serving until the addon reaches ACTIVE (typically 2-5 min). Wait for ACTIVE
+              # before touching the operator — otherwise the patch/rollout below races the install.
               execute_and_retry 30 \
                 "[ \"\$(aws eks describe-addon --cluster-name ${{ env.CLUSTER_NAME }} --addon-name amazon-cloudwatch-observability --region ${{ env.E2E_TEST_AWS_REGION }} --query 'addon.status' --output text)\" = ACTIVE ]" \
                 "" 20
 
-              # Addon is ACTIVE; the CRD should now exist. Wait for it to be Established and refresh
-              # kubectl's discovery cache before creating the CR.
-              execute_and_retry 6 \
-                "kubectl wait --for=condition=Established --timeout=60s crd/instrumentations.cloudwatch.aws.amazon.com" \
-                "" 20
-              kubectl api-resources --api-group=cloudwatch.aws.amazon.com >/dev/null 2>&1 || true
-
-              # Create this namespace's Instrumentation CR (selects THIS test's ADOT image) BEFORE
-              # restarting pods, so the operator injects the correct image when pods come back up.
-              DEFAULT_NS_NAME=$(kubectl get instrumentation -A \
-                -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' | head -n1)
-              if [ -n "$DEFAULT_NS_NAME" ]; then
-                DEF_NS=$(echo "$DEFAULT_NS_NAME" | awk '{print $1}')
-                DEF_NAME=$(echo "$DEFAULT_NS_NAME" | awk '{print $2}')
-                kubectl get instrumentation "$DEF_NAME" -n "$DEF_NS" -o json \
-                  | jq --arg ns "${{ env.SAMPLE_APP_NAMESPACE }}" --arg img "${{ env.PATCH_IMAGE_ARN }}" '
-                      .metadata = {name: "adot-python-instrumentation", namespace: $ns}
-                      | .spec.python.image = $img
-                      | del(.status)' \
+              # Inject THIS test's ADOT image the same way the sequential (main) flow does: patch the
+              # operator's cluster-wide --auto-instrumentation-python-image arg. App Signals telemetry
+              # (Latency/Error/Fault metrics + EMF logs) comes from the operator's auto-monitor
+              # applying App Signals mode to injected pods — NOT from a per-namespace Instrumentation
+              # CR. A hand-built CR with empty env bypasses that and yields plain OTel tracing with no
+              # App Signals data, which is why custom CRs produced empty validator results.
+              #
+              # This is parallel-safe: every python version job injects the SAME adot-image-name
+              # (the single staging image under test; the version differences live in the sample-app
+              # image, not the instrumentation image). So the shared operator arg is a value all jobs
+              # agree on, exactly like the shared addon. We only patch + roll out if the arg is not
+              # already the target value, so the first job patches and the rest no-op. We restart ONLY
+              # the operator deployment — never the shared cloudwatch-agent, whose restart would drop
+              # other parallel jobs' in-flight telemetry.
+              CURRENT_PY_IMAGE=$(kubectl get deploy -n amazon-cloudwatch amazon-cloudwatch-observability-controller-manager \
+                -o jsonpath='{range .spec.template.spec.containers[0].args[*]}{.}{"\n"}{end}' \
+                | sed -n 's/^--auto-instrumentation-python-image=//p')
+              if [ "$CURRENT_PY_IMAGE" != "${{ env.PATCH_IMAGE_ARN }}" ]; then
+                echo "Patching operator python image: '$CURRENT_PY_IMAGE' -> '${{ env.PATCH_IMAGE_ARN }}'"
+                kubectl get deploy -n amazon-cloudwatch amazon-cloudwatch-observability-controller-manager -o json \
+                  | jq '.spec.template.spec.containers[0].args |= map(if test("^--auto-instrumentation-python-image=") then "--auto-instrumentation-python-image=${{ env.PATCH_IMAGE_ARN }}" else . end)' \
                   | kubectl apply -f -
               else
-                # Build the CR YAML with printf (avoids heredoc indentation issues inside the
-                # YAML block scalar). \n keeps the applied manifest correctly un-indented.
-                printf '%s\n' \
-                  'apiVersion: cloudwatch.aws.amazon.com/v1alpha1' \
-                  'kind: Instrumentation' \
-                  'metadata:' \
-                  '  name: adot-python-instrumentation' \
-                  '  namespace: ${{ env.SAMPLE_APP_NAMESPACE }}' \
-                  'spec:' \
-                  '  exporter:' \
-                  '    endpoint: http://cloudwatch-agent.amazon-cloudwatch:4316/v1/metrics' \
-                  '  propagators: [tracecontext, baggage, b3, xray]' \
-                  '  sampler:' \
-                  '    type: xray' \
-                  '    argument: "endpoint=http://cloudwatch-agent.amazon-cloudwatch:2000"' \
-                  '  python:' \
-                  '    image: ${{ env.PATCH_IMAGE_ARN }}' \
-                  | kubectl apply -f -
+                echo "Operator python image already set to ${{ env.PATCH_IMAGE_ARN }}; skipping patch."
               fi
-              kubectl get instrumentation -n ${{ env.SAMPLE_APP_NAMESPACE }} -o yaml
 
-              # The addon reaching ACTIVE does not guarantee the operator's mutating webhook backend is
-              # serving yet. Wait for the operator deployment to roll out before restarting pods,
-              # otherwise pods can come up Ready but WITHOUT instrumentation injected (uninstrumented
-              # app -> zero telemetry -> validators find an empty metric list). Best-effort: the
-              # injection-verification loop below is the authoritative gate.
+              # Wait for the operator to be rolled out and serving before restarting pods. Otherwise
+              # pods can come up Ready but WITHOUT instrumentation injected (uninstrumented app -> zero
+              # telemetry -> empty validator results). The injection-verification loop below is the
+              # authoritative gate if the rollout status is slow.
               kubectl -n amazon-cloudwatch rollout status \
                 deployment/amazon-cloudwatch-observability-controller-manager --timeout=180s \
                 || echo "Operator rollout wait timed out; continuing (injection is verified below)."
 
-              # Restart this namespace's pods so the operator injects instrumentation using the CR
-              # above, then VERIFY injection actually took effect. A pod can become Ready WITHOUT being
-              # injected if the webhook was not serving when the pod was admitted. Under parallel load
-              # (multiple version jobs share the single operator/webhook) this race is real and was
-              # causing empty-telemetry validator failures for some versions. If the auto-
-              # instrumentation init container is missing we restart again until it appears.
+              # Restart this namespace's pods so the operator injects instrumentation, then VERIFY
+              # injection took effect with the CORRECT (patched) image. A pod can become Ready WITHOUT
+              # being injected if the webhook was not serving when the pod was admitted. Under parallel
+              # load (jobs share the single operator/webhook) this race is real. If the auto-
+              # instrumentation init container is missing, or still carries a non-target image, we
+              # restart again until it appears with the patched image.
               inject_verified=0
               for inject_attempt in 1 2 3 4 5; do
                 execute_and_retry 2 "kubectl delete pods --all -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 60
                 execute_and_retry 2 "kubectl wait --for=condition=Ready --request-timeout '5m' pod --all -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 10
                 INJECTED_IMAGE=$(kubectl get pod -n ${{ env.SAMPLE_APP_NAMESPACE }} --selector=app=python-app \
                   -o jsonpath='{.items[0].spec.initContainers[?(@.name=="opentelemetry-auto-instrumentation-python")].image}' 2>/dev/null || true)
-                if [ -n "$INJECTED_IMAGE" ]; then
-                  echo "Instrumentation injected on attempt $inject_attempt: $INJECTED_IMAGE"
+                if [ "$INJECTED_IMAGE" = "${{ env.PATCH_IMAGE_ARN }}" ]; then
+                  echo "Instrumentation injected with target image on attempt $inject_attempt: $INJECTED_IMAGE"
                   inject_verified=1
                   break
                 fi
-                echo "Instrumentation NOT injected on attempt $inject_attempt (webhook may not be ready yet); retrying restart..."
+                echo "Instrumentation not yet injected with target image on attempt $inject_attempt (got: '${INJECTED_IMAGE:-none}', want: '${{ env.PATCH_IMAGE_ARN }}'); retrying restart..."
                 sleep 20
               done
               if [ "$inject_verified" -ne 1 ]; then
-                echo "Instrumentation was never injected after retries; failing so this is not a silent empty-telemetry pass."
+                echo "Instrumentation was never injected with the target image after retries; failing so this is not a silent empty-telemetry pass."
                 exit 1
               fi
             fi

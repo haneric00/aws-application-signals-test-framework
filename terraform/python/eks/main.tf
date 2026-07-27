@@ -113,10 +113,13 @@ resource "kubernetes_deployment_v1" "python_app_deployment" {
           app = "python-app"
         }
         annotations = {
-          # Reference this namespace's Instrumentation CR by name (created by the
-          # create_instrumentation_cr action) so the operator injects THIS test's ADOT image,
-          # instead of the operator's shared cluster-wide default. Enables parallel per-version tests.
-          "instrumentation.opentelemetry.io/inject-python" = "adot-python-instrumentation"
+          # Opt into the CloudWatch Observability operator's auto-monitor injection. This applies
+          # Application Signals mode (OTEL_AWS_APPLICATION_SIGNALS_ENABLED etc.), which is what
+          # produces Latency/Error/Fault metrics and App Signals EMF logs. The specific ADOT image
+          # under test is selected cluster-wide by the workflow patching the operator's
+          # --auto-instrumentation-python-image arg. Parallel per-version isolation comes from unique
+          # namespaces + service names + NodePorts, not from a per-namespace Instrumentation CR.
+          "instrumentation.opentelemetry.io/inject-python" = "true"
         }
       }
       spec {
@@ -206,10 +209,13 @@ resource "kubernetes_deployment_v1" "python_r_app_deployment" {
           app = "remote-app"
         }
         annotations = {
-          # Reference this namespace's Instrumentation CR by name (created by the
-          # create_instrumentation_cr action) so the operator injects THIS test's ADOT image,
-          # instead of the operator's shared cluster-wide default. Enables parallel per-version tests.
-          "instrumentation.opentelemetry.io/inject-python" = "adot-python-instrumentation"
+          # Opt into the CloudWatch Observability operator's auto-monitor injection. This applies
+          # Application Signals mode (OTEL_AWS_APPLICATION_SIGNALS_ENABLED etc.), which is what
+          # produces Latency/Error/Fault metrics and App Signals EMF logs. The specific ADOT image
+          # under test is selected cluster-wide by the workflow patching the operator's
+          # --auto-instrumentation-python-image arg. Parallel per-version isolation comes from unique
+          # namespaces + service names + NodePorts, not from a per-namespace Instrumentation CR.
+          "instrumentation.opentelemetry.io/inject-python" = "true"
         }
       }
       spec {
