@@ -288,16 +288,35 @@ jobs:
               # already the target value, so the first job patches and the rest no-op. We restart ONLY
               # the operator deployment — never the shared cloudwatch-agent, whose restart would drop
               # other parallel jobs' in-flight telemetry.
-              CURRENT_PY_IMAGE=$(kubectl get deploy -n amazon-cloudwatch amazon-cloudwatch-observability-controller-manager \
-                -o jsonpath='{range .spec.template.spec.containers[0].args[*]}{.}{"\n"}{end}' \
-                | sed -n 's/^--auto-instrumentation-python-image=//p')
-              if [ "$CURRENT_PY_IMAGE" != "${{ env.PATCH_IMAGE_ARN }}" ]; then
-                echo "Patching operator python image: '$CURRENT_PY_IMAGE' -> '${{ env.PATCH_IMAGE_ARN }}'"
-                kubectl get deploy -n amazon-cloudwatch amazon-cloudwatch-observability-controller-manager -o json \
-                  | jq '.spec.template.spec.containers[0].args |= map(if test("^--auto-instrumentation-python-image=") then "--auto-instrumentation-python-image=${{ env.PATCH_IMAGE_ARN }}" else . end)' \
-                  | kubectl apply -f -
-              else
-                echo "Operator python image already set to ${{ env.PATCH_IMAGE_ARN }}; skipping patch."
+              # Concurrency: multiple version jobs may reach this at once. A `get | jq | apply` pipeline
+              # carries the read resourceVersion and loses to a sibling job's concurrent write with
+              # "Operation cannot be fulfilled ... the object has been modified". Since every job writes
+              # the SAME target image, we retry: re-read each attempt, treat "already target" as done,
+              # and only patch when it differs. This converges regardless of who wins the race.
+              patched=0
+              for patch_attempt in 1 2 3 4 5 6; do
+                CURRENT_PY_IMAGE=$(kubectl get deploy -n amazon-cloudwatch amazon-cloudwatch-observability-controller-manager \
+                  -o jsonpath='{range .spec.template.spec.containers[0].args[*]}{.}{"\n"}{end}' \
+                  | sed -n 's/^--auto-instrumentation-python-image=//p')
+                if [ "$CURRENT_PY_IMAGE" = "${{ env.PATCH_IMAGE_ARN }}" ]; then
+                  echo "Operator python image is set to target (${{ env.PATCH_IMAGE_ARN }})."
+                  patched=1
+                  break
+                fi
+                echo "Attempt $patch_attempt: patching operator python image '$CURRENT_PY_IMAGE' -> '${{ env.PATCH_IMAGE_ARN }}'"
+                if kubectl get deploy -n amazon-cloudwatch amazon-cloudwatch-observability-controller-manager -o json \
+                    | jq '.spec.template.spec.containers[0].args |= map(if test("^--auto-instrumentation-python-image=") then "--auto-instrumentation-python-image=${{ env.PATCH_IMAGE_ARN }}" else . end)' \
+                    | kubectl apply -f - ; then
+                  echo "Patch applied on attempt $patch_attempt."
+                  patched=1
+                  break
+                fi
+                echo "Patch attempt $patch_attempt lost a concurrent write; re-reading and retrying..."
+                sleep 10
+              done
+              if [ "$patched" -ne 1 ]; then
+                echo "Failed to set operator python image after retries."
+                exit 1
               fi
 
               # Wait for the operator to be rolled out and serving before restarting pods. Otherwise
