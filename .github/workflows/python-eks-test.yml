@@ -319,9 +319,39 @@ jobs:
               fi
               kubectl get instrumentation -n ${{ env.SAMPLE_APP_NAMESPACE }} -o yaml
 
-              # Restart this namespace's pods so the operator injects instrumentation using the CR above.
-              execute_and_retry 2 "kubectl delete pods --all -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 60
-              execute_and_retry 2 "kubectl wait --for=condition=Ready --request-timeout '5m' pod --all -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 10
+              # The addon reaching ACTIVE does not guarantee the operator's mutating webhook backend is
+              # serving yet. Wait for the operator deployment to roll out before restarting pods,
+              # otherwise pods can come up Ready but WITHOUT instrumentation injected (uninstrumented
+              # app -> zero telemetry -> validators find an empty metric list). Best-effort: the
+              # injection-verification loop below is the authoritative gate.
+              kubectl -n amazon-cloudwatch rollout status \
+                deployment/amazon-cloudwatch-observability-controller-manager --timeout=180s \
+                || echo "Operator rollout wait timed out; continuing (injection is verified below)."
+
+              # Restart this namespace's pods so the operator injects instrumentation using the CR
+              # above, then VERIFY injection actually took effect. A pod can become Ready WITHOUT being
+              # injected if the webhook was not serving when the pod was admitted. Under parallel load
+              # (multiple version jobs share the single operator/webhook) this race is real and was
+              # causing empty-telemetry validator failures for some versions. If the auto-
+              # instrumentation init container is missing we restart again until it appears.
+              inject_verified=0
+              for inject_attempt in 1 2 3 4 5; do
+                execute_and_retry 2 "kubectl delete pods --all -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 60
+                execute_and_retry 2 "kubectl wait --for=condition=Ready --request-timeout '5m' pod --all -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 10
+                INJECTED_IMAGE=$(kubectl get pod -n ${{ env.SAMPLE_APP_NAMESPACE }} --selector=app=python-app \
+                  -o jsonpath='{.items[0].spec.initContainers[?(@.name=="opentelemetry-auto-instrumentation-python")].image}' 2>/dev/null || true)
+                if [ -n "$INJECTED_IMAGE" ]; then
+                  echo "Instrumentation injected on attempt $inject_attempt: $INJECTED_IMAGE"
+                  inject_verified=1
+                  break
+                fi
+                echo "Instrumentation NOT injected on attempt $inject_attempt (webhook may not be ready yet); retrying restart..."
+                sleep 20
+              done
+              if [ "$inject_verified" -ne 1 ]; then
+                echo "Instrumentation was never injected after retries; failing so this is not a silent empty-telemetry pass."
+                exit 1
+              fi
             fi
           
             # If the deployment_failed is 1 then either the terraform deployment or the endpoint connection failed, so first destroy the
