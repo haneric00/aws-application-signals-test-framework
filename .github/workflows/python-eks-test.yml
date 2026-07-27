@@ -266,6 +266,24 @@ jobs:
 
               aws eks update-kubeconfig --region ${{ env.E2E_TEST_AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
 
+              # enable-app-signals.sh returns as soon as the addon is *requested*, while the addon is
+              # still CREATING. The Instrumentation CRD is registered by the operator that the addon
+              # deploys, so it does not exist until the addon reaches ACTIVE (typically 2-5 min). We
+              # must wait for ACTIVE first — otherwise "server doesn't have a resource type
+              # instrumentation" / "no matches for kind Instrumentation".
+              # Note: kubectl wait on an absent CRD errors instantly ("no matching resources found"),
+              # so we cannot wait on the CRD directly until the addon is up. Poll addon status first.
+              execute_and_retry 30 \
+                "[ \"\$(aws eks describe-addon --cluster-name ${{ env.CLUSTER_NAME }} --addon-name amazon-cloudwatch-observability --region ${{ env.E2E_TEST_AWS_REGION }} --query 'addon.status' --output text)\" = ACTIVE ]" \
+                "" 20
+
+              # Addon is ACTIVE; the CRD should now exist. Wait for it to be Established and refresh
+              # kubectl's discovery cache before creating the CR.
+              execute_and_retry 6 \
+                "kubectl wait --for=condition=Established --timeout=60s crd/instrumentations.cloudwatch.aws.amazon.com" \
+                "" 20
+              kubectl api-resources --api-group=cloudwatch.aws.amazon.com >/dev/null 2>&1 || true
+
               # Create this namespace's Instrumentation CR (selects THIS test's ADOT image) BEFORE
               # restarting pods, so the operator injects the correct image when pods come back up.
               DEFAULT_NS_NAME=$(kubectl get instrumentation -A \
