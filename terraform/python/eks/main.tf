@@ -113,12 +113,7 @@ resource "kubernetes_deployment_v1" "python_app_deployment" {
           app = "python-app"
         }
         annotations = {
-          # Opt into the CloudWatch Observability operator's auto-monitor injection. This applies
-          # Application Signals mode (OTEL_AWS_APPLICATION_SIGNALS_ENABLED etc.), which is what
-          # produces Latency/Error/Fault metrics and App Signals EMF logs. The specific ADOT image
-          # under test is selected cluster-wide by the workflow patching the operator's
-          # --auto-instrumentation-python-image arg. Parallel per-version isolation comes from unique
-          # namespaces + service names + NodePorts, not from a per-namespace Instrumentation CR.
+          # these annotations allow for OTel Python instrumentation
           "instrumentation.opentelemetry.io/inject-python" = "true"
         }
       }
@@ -209,12 +204,7 @@ resource "kubernetes_deployment_v1" "python_r_app_deployment" {
           app = "remote-app"
         }
         annotations = {
-          # Opt into the CloudWatch Observability operator's auto-monitor injection. This applies
-          # Application Signals mode (OTEL_AWS_APPLICATION_SIGNALS_ENABLED etc.), which is what
-          # produces Latency/Error/Fault metrics and App Signals EMF logs. The specific ADOT image
-          # under test is selected cluster-wide by the workflow patching the operator's
-          # --auto-instrumentation-python-image arg. Parallel per-version isolation comes from unique
-          # namespaces + service names + NodePorts, not from a per-namespace Instrumentation CR.
+          # these annotations allow for OTel Python instrumentation
           "instrumentation.opentelemetry.io/inject-python" = "true"
         }
       }
@@ -243,14 +233,7 @@ resource "kubernetes_service" "python_r_app_service" {
 
   metadata {
     # Name the remote Service after the remote DEPLOYMENT (python-remote-${test_id}) instead of a
-    # shared constant ("python-r-app-service"). Under parallel version jobs, multiple identically
-    # named Services made the cluster-wide CloudWatch agent resolve the caller's RemoteService to
-    # the ambiguous Service name ("python-r-app-service") instead of the deployment name the
-    # validator expects ({{remoteServiceDeploymentName}} = python-remote-${test_id}). Matching the
-    # Service name to the deployment name makes RemoteService resolve to python-remote-${test_id}
-    # regardless of whether the agent reports the Service or the workload -- both are now identical,
-    # and unique per version. The app reaches the remote by pod IP, so this rename does not affect
-    # the call path.
+    # shared constant ("python-r-app-service").
     name      = "python-remote-${var.test_id}"
     namespace = var.test_namespace
   }

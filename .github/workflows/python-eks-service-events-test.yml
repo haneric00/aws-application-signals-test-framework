@@ -299,29 +299,32 @@ jobs:
             echo PATCH_IMAGE_ARN="${{ env.ADOT_IMAGE_NAME }}" >> "$GITHUB_ENV"
           fi
 
-      # For the python repo, idempotently patch the operator's ADOT python image instead of using
-      # patch_image_and_check_diff. service-events-eks runs after the parallel eks-py* jobs, which
-      # already patched the shared operator to this same staging image; the shared action asserts the
-      # image *changed* and exits 1 when it is already correct. It also must NOT delete/reinstall the
-      # shared addon (doing so breaks the cloudwatch-agent's IRSA role binding, causing agent
-      # logs:PutLogEvents AccessDenied and dropping ALL App Signals telemetry cluster-wide). So we only
-      # patch the operator arg if it differs and restart THIS namespace's pods to pick it up. Other
-      # repos (operator) keep the shared action below.
+      # Patch the operator's ADOT python image only if it differs, then restart this namespace's pods.
       - name: Patch operator python image (idempotent) and restart sample app
         id: patch-image
         if: ${{ env.ADOT_IMAGE_NAME != '' && env.REPOSITORY_NAME == 'aws-otel-python-instrumentation' }}
         run: |
           . ${{ env.TEST_RESOURCES_FOLDER }}/.github/workflows/util/execute_and_retry.sh
+
+           # --- Patch the shared operator's python image (retry: siblings may write it concurrently) ---
           patched=0
           for patch_attempt in 1 2 3 4 5 6; do
+            # Read the operator's currently-configured python image from its container args
+
             CURRENT_PY_IMAGE=$(kubectl get deploy -n amazon-cloudwatch amazon-cloudwatch-observability-controller-manager \
               -o jsonpath='{range .spec.template.spec.containers[0].args[*]}{.}{"\n"}{end}' \
               | sed -n 's/^--auto-instrumentation-python-image=//p')
+
+            # Already the target image (e.g. an eks-py* job set it) -> nothing to do
+
             if [ "$CURRENT_PY_IMAGE" = "${{ env.PATCH_IMAGE_ARN }}" ]; then
               echo "Operator python image already at target (${{ env.PATCH_IMAGE_ARN }})."
               patched=1
               break
             fi
+            
+            # Rewrite just the --auto-instrumentation-python-image arg and apply
+
             echo "Attempt $patch_attempt: patching '$CURRENT_PY_IMAGE' -> '${{ env.PATCH_IMAGE_ARN }}'"
             if kubectl get deploy -n amazon-cloudwatch amazon-cloudwatch-observability-controller-manager -o json \
                 | jq '.spec.template.spec.containers[0].args |= map(if test("^--auto-instrumentation-python-image=") then "--auto-instrumentation-python-image=${{ env.PATCH_IMAGE_ARN }}" else . end)' \
@@ -334,11 +337,15 @@ jobs:
             sleep 10
           done
           if [ "$patched" -ne 1 ]; then echo "Failed to set operator python image."; exit 1; fi
-
+          
+          # Wait for the operator to roll out with the new arg before restarting app pods
           kubectl -n amazon-cloudwatch rollout status \
             deployment/amazon-cloudwatch-observability-controller-manager --timeout=180s \
             || echo "Operator rollout wait timed out; continuing (injection is verified below)."
-
+          
+          # --- Restart this namespace's pods and confirm the target image was actually injected ---
+          # A pod can come up Ready but uninjected if the webhook wasn't serving yet, so verify + retry.
+          
           inject_verified=0
           for inject_attempt in 1 2 3 4 5; do
             execute_and_retry 2 "kubectl delete pods --all -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 60

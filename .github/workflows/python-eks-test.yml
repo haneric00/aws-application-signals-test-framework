@@ -77,10 +77,7 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: 'aws-observability/aws-application-signals-test-framework'
-          # TESTING: pin the checked-out terraform/scripts to the feature branch instead of 'main'
-          # so the python_version variable and other EKS-test-fix changes are present. REVERT to
-          # the original `... && 'main' || github.ref` line before merge.
-          ref: ${{ inputs.caller-workflow-name == 'main-build' && 'EKS-test-fix' || github.ref }}
+          ref: ${{ inputs.caller-workflow-name == 'main-build' && 'main' || github.ref }}
           fetch-depth: 0
 
         # We initialize Gradlew Daemon early on during the workflow because sometimes initialization
@@ -156,9 +153,7 @@ jobs:
         run: |
           echo "${{ github.workspace }}/eksctl" >> "$GITHUB_PATH"
 
-      # Delete only THIS version's namespace from a prior run. Do NOT bulk-delete all ns-* namespaces:
-      # parallel version jobs share the cluster, and deleting all ns-* would destroy other running
-      # jobs' namespaces mid-test.
+      # Delete only THIS version's namespace from a prior run. Do NOT bulk-delete all ns-* namespaces
       - name: Delete this version's sample app namespace if it lingers
         continue-on-error: true
         timeout-minutes: 5
@@ -266,33 +261,28 @@ jobs:
 
               aws eks update-kubeconfig --region ${{ env.E2E_TEST_AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
 
-              # enable-app-signals.sh returns as soon as the addon is *requested*, while the addon is
-              # still CREATING. The operator (which performs injection) is deployed by the addon, so it
-              # is not serving until the addon reaches ACTIVE (typically 2-5 min). Wait for ACTIVE
-              # before touching the operator — otherwise the patch/rollout below races the install.
+              # enable-app-signals.sh returns as soon as the addon is requested, while the addon is still
+              # being created. The operator is not serving until the addon becomes active, so we need to 
+              #wait for the addon to become ACTIVE.
               execute_and_retry 30 \
                 "[ \"\$(aws eks describe-addon --cluster-name ${{ env.CLUSTER_NAME }} --addon-name amazon-cloudwatch-observability --region ${{ env.E2E_TEST_AWS_REGION }} --query 'addon.status' --output text)\" = ACTIVE ]" \
                 "" 20
 
               # Inject THIS test's ADOT image the same way the sequential (main) flow does: patch the
-              # operator's cluster-wide --auto-instrumentation-python-image arg. App Signals telemetry
-              # (Latency/Error/Fault metrics + EMF logs) comes from the operator's auto-monitor
-              # applying App Signals mode to injected pods — NOT from a per-namespace Instrumentation
-              # CR. A hand-built CR with empty env bypasses that and yields plain OTel tracing with no
-              # App Signals data, which is why custom CRs produced empty validator results.
+              # operator's cluster-wide --auto-instrumentation-python-image arg. 
               #
-              # This is parallel-safe: every python version job injects the SAME adot-image-name
-              # (the single staging image under test; the version differences live in the sample-app
-              # image, not the instrumentation image). So the shared operator arg is a value all jobs
-              # agree on, exactly like the shared addon. We only patch + roll out if the arg is not
+              # Every python version job injects the SAME adot-image-name (the single staging image 
+              # under test; the version differences live in the sample-app image, not the instrumentation image).
+               So the shared operator arg is a value all jobs agree on. We only patch + roll out if the arg is not
               # already the target value, so the first job patches and the rest no-op. We restart ONLY
               # the operator deployment — never the shared cloudwatch-agent, whose restart would drop
               # other parallel jobs' in-flight telemetry.
+              #
               # Concurrency: multiple version jobs may reach this at once. A `get | jq | apply` pipeline
               # carries the read resourceVersion and loses to a sibling job's concurrent write with
               # "Operation cannot be fulfilled ... the object has been modified". Since every job writes
               # the SAME target image, we retry: re-read each attempt, treat "already target" as done,
-              # and only patch when it differs. This converges regardless of who wins the race.
+              # and only patch when it differs. 
               patched=0
               for patch_attempt in 1 2 3 4 5 6; do
                 CURRENT_PY_IMAGE=$(kubectl get deploy -n amazon-cloudwatch amazon-cloudwatch-observability-controller-manager \
@@ -328,9 +318,7 @@ jobs:
                 || echo "Operator rollout wait timed out; continuing (injection is verified below)."
 
               # Restart this namespace's pods so the operator injects instrumentation, then VERIFY
-              # injection took effect with the CORRECT (patched) image. A pod can become Ready WITHOUT
-              # being injected if the webhook was not serving when the pod was admitted. Under parallel
-              # load (jobs share the single operator/webhook) this race is real. If the auto-
+              # injection took effect with the CORRECT (patched) image. If the auto-
               # instrumentation init container is missing, or still carries a non-target image, we
               # restart again until it appears with the patched image.
               inject_verified=0
@@ -356,9 +344,6 @@ jobs:
             # If the deployment_failed is 1 then either the terraform deployment or the endpoint connection failed, so first destroy the
             # resources created from terraform and try again.
             if [ $deployment_failed -eq 1 ]; then
-              # Do NOT run clean-app-signals.sh here: the Application Signals addon is cluster-wide and
-              # shared by the other parallel version jobs — deleting it would break them. Only tear down
-              # this version's own terraform resources.
               echo "Destroying terraform"
               terraform destroy -auto-approve \
                 -var='python_version=${{ env.PYTHON_VERSION }}'\
