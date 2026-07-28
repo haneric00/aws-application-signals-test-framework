@@ -59,6 +59,20 @@ provider "kubectl" {
   load_config_file       = false
 }
 
+# Compute unique NodePorts per Python version so EKS test jobs can run in parallel
+# on the same cluster without "port is already allocated" collisions.
+locals {
+  version_offset = {
+    "3.10" = 0
+    "3.11" = 1
+    "3.12" = 2
+    "3.13" = 3
+    "3.14" = 4
+  }
+  main_node_port   = 30100 + lookup(local.version_offset, var.python_version, 1) * 2
+  remote_node_port = 30101 + lookup(local.version_offset, var.python_version, 1) * 2
+}
+
 data "template_file" "kubeconfig_file" {
   template = file("./kubeconfig.tpl")
   vars = {
@@ -99,7 +113,12 @@ resource "kubernetes_deployment_v1" "python_app_deployment" {
           app = "python-app"
         }
         annotations = {
-          # these annotations allow for OTel Python instrumentation
+          # Opt into the CloudWatch Observability operator's auto-monitor injection. This applies
+          # Application Signals mode (OTEL_AWS_APPLICATION_SIGNALS_ENABLED etc.), which is what
+          # produces Latency/Error/Fault metrics and App Signals EMF logs. The specific ADOT image
+          # under test is selected cluster-wide by the workflow patching the operator's
+          # --auto-instrumentation-python-image arg. Parallel per-version isolation comes from unique
+          # namespaces + service names + NodePorts, not from a per-namespace Instrumentation CR.
           "instrumentation.opentelemetry.io/inject-python" = "true"
         }
       }
@@ -160,7 +179,7 @@ resource "kubernetes_service" "python_app_service" {
       protocol    = "TCP"
       port        = 8080
       target_port = 8000
-      node_port   = 30100
+      node_port   = local.main_node_port
     }
   }
 }
@@ -190,7 +209,12 @@ resource "kubernetes_deployment_v1" "python_r_app_deployment" {
           app = "remote-app"
         }
         annotations = {
-          # these annotations allow for OTel Python instrumentation
+          # Opt into the CloudWatch Observability operator's auto-monitor injection. This applies
+          # Application Signals mode (OTEL_AWS_APPLICATION_SIGNALS_ENABLED etc.), which is what
+          # produces Latency/Error/Fault metrics and App Signals EMF logs. The specific ADOT image
+          # under test is selected cluster-wide by the workflow patching the operator's
+          # --auto-instrumentation-python-image arg. Parallel per-version isolation comes from unique
+          # namespaces + service names + NodePorts, not from a per-namespace Instrumentation CR.
           "instrumentation.opentelemetry.io/inject-python" = "true"
         }
       }
@@ -218,7 +242,16 @@ resource "kubernetes_service" "python_r_app_service" {
   depends_on = [kubernetes_deployment_v1.python_r_app_deployment]
 
   metadata {
-    name      = "python-r-app-service"
+    # Name the remote Service after the remote DEPLOYMENT (python-remote-${test_id}) instead of a
+    # shared constant ("python-r-app-service"). Under parallel version jobs, multiple identically
+    # named Services made the cluster-wide CloudWatch agent resolve the caller's RemoteService to
+    # the ambiguous Service name ("python-r-app-service") instead of the deployment name the
+    # validator expects ({{remoteServiceDeploymentName}} = python-remote-${test_id}). Matching the
+    # Service name to the deployment name makes RemoteService resolve to python-remote-${test_id}
+    # regardless of whether the agent reports the Service or the workload -- both are now identical,
+    # and unique per version. The app reaches the remote by pod IP, so this rename does not affect
+    # the call path.
+    name      = "python-remote-${var.test_id}"
     namespace = var.test_namespace
   }
   spec {
@@ -230,7 +263,7 @@ resource "kubernetes_service" "python_r_app_service" {
       protocol    = "TCP"
       port        = 8001
       target_port = 8001
-      node_port   = 30101
+      node_port   = local.remote_node_port
     }
   }
 }

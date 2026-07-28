@@ -214,6 +214,31 @@ jobs:
           max_retry: 6
           sleep_time: 60
 
+      # service-events runs LAST, after all parallel eks-py* jobs (see caller `needs:`), which leave
+      # the shared amazon-cloudwatch-observability addon installed with the operator's ADOT python
+      # image patched to the staging build. enable-app-signals.sh is idempotent and will NOT reset an
+      # already-installed addon, so the operator would stay on the staging image and the downstream
+      # patch_image_and_check_diff step would fail ("ADOT image did not change"). Since this job runs
+      # exclusively (no parallel job is alive), fully delete the addon here and wait for it to be gone;
+      # the Deploy step's enable-app-signals.sh then performs a clean install with the operator back on
+      # its default image, restoring the default -> staging transition the diff check expects. Safe only
+      # because this job is gated on all eks-py* jobs.
+      - name: Rebuild Application Signals addon from scratch (operator back to default image)
+        if: ${{ env.ADOT_IMAGE_NAME != '' }}
+        continue-on-error: true
+        run: |
+          if aws eks describe-addon --cluster-name ${{ env.CLUSTER_NAME }} \
+               --addon-name amazon-cloudwatch-observability --region ${{ env.E2E_TEST_AWS_REGION }} >/dev/null 2>&1; then
+            echo "Deleting existing amazon-cloudwatch-observability addon so it reinstalls at the default image."
+            aws eks delete-addon --cluster-name ${{ env.CLUSTER_NAME }} \
+              --addon-name amazon-cloudwatch-observability --region ${{ env.E2E_TEST_AWS_REGION }} || true
+            echo "Waiting for addon deletion to complete..."
+            aws eks wait addon-deleted --cluster-name ${{ env.CLUSTER_NAME }} \
+              --addon-name amazon-cloudwatch-observability --region ${{ env.E2E_TEST_AWS_REGION }} || true
+          else
+            echo "Addon not present; enable-app-signals.sh will install it fresh."
+          fi
+
       - name: Deploy sample app via terraform and install Application Signals
         id: deploy-python-app
         working-directory: terraform/python/eks/service-events
