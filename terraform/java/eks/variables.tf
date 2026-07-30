@@ -56,7 +56,4 @@ variable "java_version" {
 variable "account_id" {
   default = "<AWS_ACCOUNT_ID>"
 }
-
-variable "java_version" {
-  default = "11"
-}
+å
