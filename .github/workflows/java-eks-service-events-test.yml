@@ -89,7 +89,9 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: 'aws-observability/aws-application-signals-test-framework'
-          ref: ${{ inputs.caller-workflow-name == 'main-build' && 'main' || github.ref }}
+          # TESTING: pin to the feature branch so this workflow's script/terraform changes are
+          # present. REVERT to `... && 'main' || github.ref` before merge.
+          ref: ${{ inputs.caller-workflow-name == 'main-build' && 'java-eks-parallel-wip' || github.ref }}
           fetch-depth: 0
 
       - name: Initiate Gradlew Daemon
@@ -173,11 +175,12 @@ jobs:
       - name: Add eksctl to Github Path
         run: echo "${{ github.workspace }}/eksctl" >> "$GITHUB_PATH"
 
-      # Delete lingering sample app namespaces from previous test runs
-      - name: Delete all sample app namespaces
+      # Delete only THIS run's namespace if it lingers. Do NOT bulk-delete all ns-* namespaces: the
+      # version test jobs share the cluster, and deleting all ns-* would destroy their namespaces.
+      - name: Delete this run's sample app namespace if it lingers
         continue-on-error: true
         timeout-minutes: 5
-        run: kubectl get namespace | awk '/^ns-[0-9]+-[0-9]+/{print $1}' | xargs --no-run-if-empty kubectl delete namespace
+        run: kubectl delete namespace "${{ env.SAMPLE_APP_NAMESPACE }}" --ignore-not-found
 
       - name: Create role for AWS access from the sample app
         id: create_service_account
@@ -242,32 +245,31 @@ jobs:
             if [ $deployment_failed -eq 0 ]; then
               echo "Installing Application Signals to the sample app"
               . ${{ env.TEST_RESOURCES_FOLDER }}/.github/workflows/util/execute_and_retry.sh
+              # Install the cluster-wide Application Signals addon (idempotent: already present if a
+              # prior job installed it). Do NOT pass a clean-up command that deletes the addon — the
+              # addon is shared and deleting it can drop the CloudWatch agent's IRSA role, dropping
+              # App Signals telemetry cluster-wide.
               execute_and_retry 3 \
               "${{ env.TEST_RESOURCES_FOLDER }}/enablement-script/enable-app-signals.sh \
               ${{ env.CLUSTER_NAME }} \
               ${{ env.E2E_TEST_AWS_REGION }} \
               ${{ env.SAMPLE_APP_NAMESPACE }}" \
-              "${{ env.TEST_RESOURCES_FOLDER }}/enablement-script/clean-app-signals.sh \
-              ${{ env.CLUSTER_NAME }} \
-              ${{ env.E2E_TEST_AWS_REGION }} \
-              ${{ env.SAMPLE_APP_NAMESPACE }} && \
-              aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.E2E_TEST_AWS_REGION }}" \
+              "" \
               60
 
               aws eks update-kubeconfig --region ${{ env.E2E_TEST_AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
 
-              # Restart pods so the now-installed operator injects ADOT instrumentation, then wait.
-              execute_and_retry 2 "kubectl delete pods --all -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 60
-              execute_and_retry 2 "kubectl wait --for=condition=Ready --request-timeout '5m' pod --all -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 10
+              # enable-app-signals.sh returns while the addon is still CREATING. Wait for it to reach
+              # ACTIVE before patching the operator below — otherwise the patch/rollout races the install.
+              execute_and_retry 30 \
+                "[ \"\$(aws eks describe-addon --cluster-name ${{ env.CLUSTER_NAME }} --addon-name amazon-cloudwatch-observability --region ${{ env.E2E_TEST_AWS_REGION }} --query 'addon.status' --output text)\" = ACTIVE ]" \
+                "" 20
             fi
 
             if [ $deployment_failed -ne 0 ]; then
-              echo "Deployment failed. Cleaning up Application Signals and terraform, then retrying."
-              ${{ env.TEST_RESOURCES_FOLDER }}/enablement-script/clean-app-signals.sh \
-              ${{ env.CLUSTER_NAME }} \
-              ${{ env.E2E_TEST_AWS_REGION }} \
-              ${{ env.SAMPLE_APP_NAMESPACE }} || true
-              aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.E2E_TEST_AWS_REGION }}
+              # Do NOT run clean-app-signals.sh here: the addon is cluster-wide and shared. Only tear
+              # down this run's own terraform resources before retrying.
+              echo "Deployment failed. Destroying terraform, then retrying."
               terraform destroy -auto-approve \
                 -var="aws_region=${{ env.E2E_TEST_AWS_REGION }}" \
                 -var="test_id=${{ env.TESTING_ID }}" \
@@ -288,9 +290,9 @@ jobs:
             fi
           done
 
-      # Optionally patch in the ADOT image / operator tag under test. Skipped on manual
-      # dispatch with no image, in which case the operator's default (SE-capable) ADOT is used.
-      - name: Get ECR to Patch
+      # Optionally patch in the ADOT image / operator tag under test. Skipped on manual dispatch with
+      # no image, in which case the operator's default (SE-capable) ADOT is used.
+      - name: Determine ADOT image to inject
         if: ${{ env.ADOT_IMAGE_NAME != '' || env.CW_AGENT_OPERATOR_TAG != '' }}
         run: |
           if [ "${{ env.REPOSITORY_NAME }}" = "amazon-cloudwatch-agent-operator" ]; then
@@ -299,9 +301,62 @@ jobs:
             echo PATCH_IMAGE_ARN="${{ env.ADOT_IMAGE_NAME }}" >> "$GITHUB_ENV"
           fi
 
-      - name: Patch Image and Check Diff
+      # For the java repo, idempotently patch the operator's ADOT java image, then restart+verify this
+      # namespace's pods. Not patch_image_and_check_diff: it asserts the image *changed* and fails when
+      # the operator is already on the target image (the version jobs may have set it), and it deletes
+      # the shared addon (breaking the agent IRSA and dropping telemetry). Patch only if it differs.
+      - name: Patch operator java image (idempotent) and restart sample app
         id: patch-image
-        if: ${{ env.ADOT_IMAGE_NAME != '' || env.CW_AGENT_OPERATOR_TAG != '' }}
+        if: ${{ env.ADOT_IMAGE_NAME != '' && env.REPOSITORY_NAME == 'aws-otel-java-instrumentation' }}
+        run: |
+          . ${{ env.TEST_RESOURCES_FOLDER }}/.github/workflows/util/execute_and_retry.sh
+          patched=0
+          for patch_attempt in 1 2 3 4 5 6; do
+            CURRENT_JAVA_IMAGE=$(kubectl get deploy -n amazon-cloudwatch amazon-cloudwatch-observability-controller-manager \
+              -o jsonpath='{range .spec.template.spec.containers[0].args[*]}{.}{"\n"}{end}' \
+              | sed -n 's/^--auto-instrumentation-java-image=//p')
+            if [ "$CURRENT_JAVA_IMAGE" = "${{ env.PATCH_IMAGE_ARN }}" ]; then
+              echo "Operator java image already at target (${{ env.PATCH_IMAGE_ARN }})."
+              patched=1
+              break
+            fi
+            echo "Attempt $patch_attempt: patching '$CURRENT_JAVA_IMAGE' -> '${{ env.PATCH_IMAGE_ARN }}'"
+            if kubectl get deploy -n amazon-cloudwatch amazon-cloudwatch-observability-controller-manager -o json \
+                | jq '.spec.template.spec.containers[0].args |= map(if test("^--auto-instrumentation-java-image=") then "--auto-instrumentation-java-image=${{ env.PATCH_IMAGE_ARN }}" else . end)' \
+                | kubectl apply -f - ; then
+              echo "Patch applied on attempt $patch_attempt."
+              patched=1
+              break
+            fi
+            echo "Patch attempt $patch_attempt lost a concurrent write; retrying..."
+            sleep 10
+          done
+          if [ "$patched" -ne 1 ]; then echo "Failed to set operator java image."; exit 1; fi
+
+          kubectl -n amazon-cloudwatch rollout status \
+            deployment/amazon-cloudwatch-observability-controller-manager --timeout=180s \
+            || echo "Operator rollout wait timed out; continuing (injection is verified below)."
+
+          inject_verified=0
+          for inject_attempt in 1 2 3 4 5; do
+            execute_and_retry 2 "kubectl delete pods --all -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 60
+            execute_and_retry 2 "kubectl wait --for=condition=Ready --request-timeout '5m' pod --all -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 10
+            INJECTED_IMAGE=$(kubectl get pod -n ${{ env.SAMPLE_APP_NAMESPACE }} --selector=app=java-app \
+              -o jsonpath='{.items[0].spec.initContainers[?(@.name=="opentelemetry-auto-instrumentation-java")].image}' 2>/dev/null || true)
+            if [ "$INJECTED_IMAGE" = "${{ env.PATCH_IMAGE_ARN }}" ]; then
+              echo "Instrumentation injected with target image on attempt $inject_attempt: $INJECTED_IMAGE"
+              inject_verified=1
+              break
+            fi
+            echo "Not injected with target image yet on attempt $inject_attempt (got: '${INJECTED_IMAGE:-none}'); retrying restart..."
+            sleep 20
+          done
+          if [ "$inject_verified" -ne 1 ]; then echo "Instrumentation never injected with the target image."; exit 1; fi
+
+      # For the operator repo, keep the shared patch+diff action.
+      - name: Patch Image and Check Diff
+        id: patch-image-operator
+        if: ${{ env.CW_AGENT_OPERATOR_TAG != '' && env.REPOSITORY_NAME != 'aws-otel-java-instrumentation' }}
         uses: ./.github/workflows/actions/patch_image_and_check_diff
         with:
           repository: ${{ env.REPOSITORY_NAME }}
@@ -417,23 +472,10 @@ jobs:
           fi
 
       # ---- Clean up (each step scoped to this run's namespace / resources only) ----
-
-      - name: Clean Up Application Signals
-        if: always()
-        continue-on-error: true
-        working-directory: enablement-script
-        run: |
-          ./clean-app-signals.sh \
-          ${{ env.CLUSTER_NAME }} \
-          ${{ env.E2E_TEST_AWS_REGION }} \
-          ${{ env.SAMPLE_APP_NAMESPACE }}
-
-      # clean-app-signals.sh removes the current cluster from kubeconfig; re-add it for the
-      # subsequent destroy/delete steps.
-      - name: Restore kubeconfig
-        if: always()
-        continue-on-error: true
-        run: aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.E2E_TEST_AWS_REGION }}
+      # NOTE: the cluster-wide Application Signals addon is intentionally NOT removed here — it is
+      # shared and persists on the long-lived test cluster. Deleting it (clean-app-signals.sh) can
+      # drop the CloudWatch agent's IRSA role and break telemetry cluster-wide. Only this run's own
+      # namespace and terraform resources are torn down.
 
       - name: Terraform destroy
         if: always()

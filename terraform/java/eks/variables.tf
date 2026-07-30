@@ -49,6 +49,10 @@ variable "sample_remote_app_image" {
   default = "<ECR_IMAGE_LINK>:<TAG>"
 }
 
+variable "java_version" {
+  default = "8"
+}
+
 variable "account_id" {
   default = "<AWS_ACCOUNT_ID>"
 }
