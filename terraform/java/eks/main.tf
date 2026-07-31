@@ -176,7 +176,13 @@ resource "kubernetes_service" "sample_app_service" {
 resource "kubernetes_deployment" "sample_remote_app_deployment" {
 
   metadata {
-    name      = "sample-r-app-deployment-${var.test_id}"
+    # Keep this prefix short: the CloudWatch agent derives RemoteService from the pod name by
+    # stripping the "-<replicaset-hash>-<pod-hash>" suffixes, and k8s truncates pod names to 63
+    # chars. The longer "sample-r-app-deployment-" prefix pushed the name past that limit for the
+    # parallel per-version test_id, so the derived name no longer matched the trace template and
+    # validation failed for every version but the first. "java-remote-" mirrors Python's working
+    # "python-remote-" prefix and stays under the 47-char edge-case threshold (see PR #1553 below).
+    name      = "java-remote-${var.test_id}"
     namespace = var.test_namespace
     labels = {
       app = "remote-app"
@@ -226,7 +232,7 @@ resource "kubernetes_service" "sample_remote_app_deployment" {
     # use the same name as the deployment to handle the edge case when the deployment name is longer than 47 characters
     # in this edge case, we just use the service name (rather than deployment name) as RemoteService
     # see https://github.com/aws/amazon-cloudwatch-agent/pull/1553
-    name      = "sample-r-app-deployment-${var.test_id}"
+    name      = "java-remote-${var.test_id}"
     namespace = var.test_namespace
   }
   spec {
