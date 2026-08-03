@@ -89,7 +89,10 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: 'aws-observability/aws-application-signals-test-framework'
-          ref: ${{ inputs.caller-workflow-name == 'main-build' && 'main' || github.ref }}
+          # TESTING PIN — see python-eks-test.yml. REVERT to
+          #   ref: ${{ inputs.caller-workflow-name == 'main-build' && 'main' || github.ref }}
+          # before merge.
+          ref: ${{ inputs.caller-workflow-name == 'main-build' && 'fix-eks-irsa-setup-race' || github.ref }}
           fetch-depth: 0
 
       - name: Initiate Gradlew Daemon
