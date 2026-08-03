@@ -88,12 +88,14 @@ jobs:
           wget -q https://raw.githubusercontent.com/aws-observability/application-signals-demo/main/scripts/eks/appsignals/enable-app-signals.sh
           chmod +x enable-app-signals.sh
 
-      # The e2e log group is shared and long-lived; the enablement script must not delete it.
-      - name: Remove log group deletion command
+      # enable-app-signals.sh has an interactive `read -p` on the addon-upgrade path (fires when the
+      # addon exists but predates v1.4.0). With no stdin in CI that silently takes the "Aborted
+      # upgrading" branch, leaving a stale addon. Feed it "yes" via stdin at call time instead of
+      # patching the script. (The log-group deletion line lives only in clean-app-signals.sh, so no
+      # sed is needed here.)
+      - name: Show enablement script version info
         working-directory: enablement-script
-        run: |
-          delete_log_group="aws logs delete-log-group --log-group-name '${{ env.LOG_GROUP_NAME }}' --region \$REGION"
-          sed -i "s#$delete_log_group##g" enable-app-signals.sh
+        run: grep -n "read -p" enable-app-signals.sh || echo "No interactive prompt in this revision."
 
       - name: Set up kubeconfig
         run: aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.E2E_TEST_AWS_REGION }}
@@ -128,7 +130,8 @@ jobs:
           # --auto-instrumentation-python-image arg, which the per-version test jobs patch.
           for attempt in 1 2 3; do
             echo "enable-app-signals.sh attempt $attempt"
-            if ./enable-app-signals.sh "${{ env.CLUSTER_NAME }}" "${{ env.E2E_TEST_AWS_REGION }}" default; then
+            # `yes |` answers the script's interactive addon-upgrade prompt non-interactively.
+            if yes | ./enable-app-signals.sh "${{ env.CLUSTER_NAME }}" "${{ env.E2E_TEST_AWS_REGION }}" default; then
               echo "App Signals enablement succeeded."
               exit 0
             fi
