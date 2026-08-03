@@ -245,28 +245,31 @@ jobs:
             # If the deployment_failed is still 0, then the terraform deployment succeeded and now try to connect to the endpoint 
             # after installing Application Signals. Attempts to connect will be made for up to 10 minutes
             if [ $deployment_failed -eq 0 ]; then
-              echo "Ensuring Application Signals is enabled on the cluster"
+              echo "Verifying Application Signals is enabled on the cluster"
               . ${{ env.TEST_RESOURCES_FOLDER }}/.github/workflows/util/execute_and_retry.sh
-              # Install the cluster-wide Application Signals addon. This is idempotent: the first
-              # parallel version job installs it, the rest see it already present. We intentionally do
-              # NOT pass a per-job clean-up command here — deleting the shared addon would break other
-              # parallel jobs. The addon persists on the (long-lived) test cluster.
-              execute_and_retry 3 \
-              "${{ env.TEST_RESOURCES_FOLDER }}/enablement-script/enable-app-signals.sh \
-              ${{ inputs.test-cluster-name }} \
-              ${{ env.E2E_TEST_AWS_REGION }} \
-              ${{ env.SAMPLE_APP_NAMESPACE }}" \
-              "" \
-              60
 
               aws eks update-kubeconfig --region ${{ env.E2E_TEST_AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
 
-              # enable-app-signals.sh returns as soon as the addon is requested, while the addon is still
-              # being created. The operator is not serving until the addon becomes active, so we need to 
-              #wait for the addon to become ACTIVE.
               execute_and_retry 30 \
                 "[ \"\$(aws eks describe-addon --cluster-name ${{ env.CLUSTER_NAME }} --addon-name amazon-cloudwatch-observability --region ${{ env.E2E_TEST_AWS_REGION }} --query 'addon.status' --output text)\" = ACTIVE ]" \
                 "" 20
+
+              # Fail fast with a clear message if the agent lacks projected IRSA credentials. Without
+              # this the only symptom is a validator timing out on missing telemetry 30 minutes later.
+              # Assert only -- never restart the shared DaemonSet from a per-version job, since that
+              # would drop sibling jobs' in-flight telemetry.
+              
+              agent_missing_irsa=$(kubectl get pods -n amazon-cloudwatch -l app.kubernetes.io/name=cloudwatch-agent \
+                -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.spec.containers[0].env[?(@.name=="AWS_ROLE_ARN")].value}{"\n"}{end}' \
+                | awk -F'|' '$2==""{print $1}')
+              if [ -n "$agent_missing_irsa" ]; then
+                echo "::error::cloudwatch-agent pods lack projected IRSA credentials: $agent_missing_irsa"
+                echo "The agent will authenticate as the EC2 node role and get AccessDeniedException on"
+                echo "logs:PutLogEvents, so no telemetry will reach CloudWatch and validation will fail."
+                echo "Shared setup (eks-setup-app-signals.yml) should have established this."
+                exit 1
+              fi
+              echo "cloudwatch-agent has IRSA credentials projected."
 
               # Inject THIS test's ADOT image the same way the sequential (main) flow does: patch the
               # operator's cluster-wide --auto-instrumentation-python-image arg. 

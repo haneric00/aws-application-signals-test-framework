@@ -173,11 +173,12 @@ jobs:
       - name: Add eksctl to Github Path
         run: echo "${{ github.workspace }}/eksctl" >> "$GITHUB_PATH"
 
-      # Delete lingering sample app namespaces from previous test runs
-      - name: Delete all sample app namespaces
+      # Delete only THIS run's namespace if it lingers from a previous run. Do NOT bulk-delete all
+      # ns-* namespaces: on the shared cluster that destroys sibling jobs' live test namespaces.
+      - name: Delete this run's sample app namespace if it lingers
         continue-on-error: true
         timeout-minutes: 5
-        run: kubectl get namespace | awk '/^ns-[0-9]+-[0-9]+/{print $1}' | xargs --no-run-if-empty kubectl delete namespace
+        run: kubectl delete namespace "${{ env.SAMPLE_APP_NAMESPACE }}" --ignore-not-found
 
       - name: Create role for AWS access from the sample app
         id: create_service_account
@@ -240,17 +241,24 @@ jobs:
             || deployment_failed=$?
 
             if [ $deployment_failed -eq 0 ]; then
-              echo "Installing Application Signals to the sample app"
+              echo "Verifying Application Signals is enabled on the cluster"
               . ${{ env.TEST_RESOURCES_FOLDER }}/.github/workflows/util/execute_and_retry.sh
-              execute_and_retry 3 \
-              "${{ env.TEST_RESOURCES_FOLDER }}/enablement-script/enable-app-signals.sh \
-              ${{ env.CLUSTER_NAME }} \
-              ${{ env.E2E_TEST_AWS_REGION }} \
-              ${{ env.SAMPLE_APP_NAMESPACE }}" \
-              "" \
-              60
 
               aws eks update-kubeconfig --region ${{ env.E2E_TEST_AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
+
+              execute_and_retry 30 \
+                "[ \"\$(aws eks describe-addon --cluster-name ${{ env.CLUSTER_NAME }} --addon-name amazon-cloudwatch-observability --region ${{ env.E2E_TEST_AWS_REGION }} --query 'addon.status' --output text)\" = ACTIVE ]" \
+                "" 20
+
+              agent_missing_irsa=$(kubectl get pods -n amazon-cloudwatch -l app.kubernetes.io/name=cloudwatch-agent \
+                -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.spec.containers[0].env[?(@.name=="AWS_ROLE_ARN")].value}{"\n"}{end}' \
+                | awk -F'|' '$2==""{print $1}')
+              if [ -n "$agent_missing_irsa" ]; then
+                echo "::error::cloudwatch-agent pods lack projected IRSA credentials: $agent_missing_irsa"
+                echo "Telemetry will not reach CloudWatch and validation will fail on missing data."
+                exit 1
+              fi
+              echo "cloudwatch-agent has IRSA credentials projected."
 
               # Restart pods so the now-installed operator injects ADOT instrumentation, then wait.
               execute_and_retry 2 "kubectl delete pods --all -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 60
