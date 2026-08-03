@@ -310,7 +310,23 @@ jobs:
               inject_verified=0
               for inject_attempt in 1 2 3 4 5; do
                 execute_and_retry 2 "kubectl delete pods --all -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 60
-                execute_and_retry 2 "kubectl wait --for=condition=Ready --request-timeout '5m' pod --all -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 10
+                # Wait ONLY on the instrumented app pods (sample-app, remote-app) -- NOT `pod --all`.
+                #
+                # `pod --all` also waits on traffic-generator, which cannot become Ready at this point
+                # in the workflow: it only learns MAIN_ENDPOINT/REMOTE_ENDPOINT from the later
+                # "kubectl set env deployment/traffic-generator" step, which runs after the endpoint
+                # discovery steps further below. With no endpoints to hit, it restarts instead of going
+                # Ready, `kubectl wait` times out, and execute_and_retry's `exit 1` (see
+                # .github/workflows/util/execute_and_retry.sh) kills the whole job. That produced the
+                # intermittent "timed out waiting for the condition on pods/traffic-generator" failures
+                # where sample-app / remote-app / sql all reported "condition met".
+                #
+                # Only sample-app and remote-app readiness matters here: the injection check on the next
+                # line inspects app=sample-app, and both are the pods that must carry the
+                # auto-instrumentation init container. traffic-generator and mysql readiness is
+                # irrelevant to instrumentation and is covered by the endpoint checks later.
+                execute_and_retry 2 "kubectl wait --for=condition=Ready --request-timeout '5m' pod -l app=sample-app -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 10
+                execute_and_retry 2 "kubectl wait --for=condition=Ready --request-timeout '5m' pod -l app=remote-app -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 10
                 INJECTED_IMAGE=$(kubectl get pod -n ${{ env.SAMPLE_APP_NAMESPACE }} --selector=app=sample-app \
                   -o jsonpath='{.items[0].spec.initContainers[?(@.name=="opentelemetry-auto-instrumentation-java")].image}' 2>/dev/null || true)
                 if [ "$INJECTED_IMAGE" = "${{ env.PATCH_IMAGE_ARN }}" ]; then
