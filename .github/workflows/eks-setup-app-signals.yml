@@ -54,8 +54,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      # Must explicitly check out the FRAMEWORK repo. A bare actions/checkout in a reusable workflow
+      # clones the CALLER repo (aws-otel-python-instrumentation), which has no
+      # .github/workflows/util/execute_and_retry.sh.
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
+          repository: 'aws-observability/aws-application-signals-test-framework'
+          # TESTING PIN — REVERT to 'main' before merge.
+          ref: 'fix-eks-irsa-setup-race'
           fetch-depth: 0
 
       - name: Configure AWS Credentials
@@ -112,26 +118,49 @@ jobs:
             echo "No active test namespaces; safe to set up App Signals."
           fi
 
+      # Retries are implemented inline rather than sourcing .github/workflows/util/execute_and_retry.sh
+      # so this job does not depend on the framework repo being the checked-out workspace.
       - name: Install Application Signals (addon + cloudwatch-agent IRSA)
         working-directory: enablement-script
         run: |
-          . ${{ github.workspace }}/.github/workflows/util/execute_and_retry.sh
           # `default` namespace: this job only establishes cluster-wide state. Per-test namespace
           # annotation is not needed here -- App Signals mode comes from the operator's cluster-wide
           # --auto-instrumentation-python-image arg, which the per-version test jobs patch.
-          execute_and_retry 3 \
-            "./enable-app-signals.sh ${{ env.CLUSTER_NAME }} ${{ env.E2E_TEST_AWS_REGION }} default" \
-            "" \
-            60
+          for attempt in 1 2 3; do
+            echo "enable-app-signals.sh attempt $attempt"
+            if ./enable-app-signals.sh "${{ env.CLUSTER_NAME }}" "${{ env.E2E_TEST_AWS_REGION }}" default; then
+              echo "App Signals enablement succeeded."
+              exit 0
+            fi
+            echo "Attempt $attempt failed."
+            [ "$attempt" -lt 3 ] && sleep 60
+          done
+          echo "::error::enable-app-signals.sh failed after 3 attempts."
+          exit 1
 
       # enable-app-signals.sh returns as soon as the addon is REQUESTED. The operator is not serving
       # until the addon is ACTIVE.
       - name: Wait for addon to become ACTIVE
         run: |
-          . ${{ github.workspace }}/.github/workflows/util/execute_and_retry.sh
-          execute_and_retry 30 \
-            "[ \"\$(aws eks describe-addon --cluster-name ${{ env.CLUSTER_NAME }} --addon-name amazon-cloudwatch-observability --region ${{ env.E2E_TEST_AWS_REGION }} --query 'addon.status' --output text)\" = ACTIVE ]" \
-            "" 20
+          for attempt in $(seq 1 30); do
+            status=$(aws eks describe-addon \
+              --cluster-name "${{ env.CLUSTER_NAME }}" \
+              --addon-name amazon-cloudwatch-observability \
+              --region "${{ env.E2E_TEST_AWS_REGION }}" \
+              --query 'addon.status' --output text 2>/dev/null || echo "UNKNOWN")
+            echo "Attempt $attempt: addon status = $status"
+            if [ "$status" = "ACTIVE" ]; then
+              echo "Addon is ACTIVE."
+              exit 0
+            fi
+            if [ "$status" = "CREATE_FAILED" ] || [ "$status" = "DEGRADED" ]; then
+              echo "::error::Addon entered terminal state $status"
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "::error::Addon did not become ACTIVE within ~10 minutes."
+          exit 1
 
       # ADDON ACTIVE DOES NOT IMPLY THE AGENT HAS CREDENTIALS. The addon reconciling only means its
       # resources exist; it says nothing about whether the DaemonSet pods were admitted while the
