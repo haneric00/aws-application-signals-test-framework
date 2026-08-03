@@ -172,21 +172,32 @@ jobs:
       # here (and ONLY here) because no test job is running yet, so no in-flight telemetry can be lost.
       - name: Verify cloudwatch-agent has IRSA credentials projected
         run: |
-          kubectl rollout status daemonset/cloudwatch-agent -n amazon-cloudwatch --timeout=300s
+          # Tolerate failure here: on a freshly created addon the DaemonSet may not exist yet. The
+          # retry loop below is the real gate, so don't abort the job on a transient rollout error.
+          kubectl rollout status daemonset/cloudwatch-agent -n amazon-cloudwatch --timeout=300s || true
 
           for attempt in 1 2 3 4 5 6; do
-            missing=$(kubectl get pods -n amazon-cloudwatch -l app.kubernetes.io/name=cloudwatch-agent \
-              -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.spec.containers[0].env[?(@.name=="AWS_ROLE_ARN")].value}{"\n"}{end}' \
-              | awk -F'|' '$2==""{print $1}')
+            # Require POSITIVE proof: at least one pod, all carrying AWS_ROLE_ARN. Testing only for
+            # "nothing missing" passes vacuously when kubectl errors or zero pods exist -- which would
+            # skip the repair below and hand a credential-less agent to every downstream test job.
+            pods=$(kubectl get pods -n amazon-cloudwatch -l app.kubernetes.io/name=cloudwatch-agent \
+              -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.spec.containers[0].env[?(@.name=="AWS_ROLE_ARN")].value}{"\n"}{end}' 2>/dev/null) || pods=""
+            pods=$(printf '%s\n' "$pods" | grep -v '^[[:space:]]*$' || true)
+            total=$(printf '%s\n' "$pods" | grep -c . || true)
+            missing=$(printf '%s\n' "$pods" | awk -F'|' '$2==""{print $1}')
 
-            if [ -z "$missing" ]; then
-              echo "All cloudwatch-agent pods have AWS_ROLE_ARN projected."
+            if [ "${total:-0}" -gt 0 ] && [ -z "$missing" ]; then
+              echo "All $total cloudwatch-agent pod(s) have AWS_ROLE_ARN projected."
               kubectl get pods -n amazon-cloudwatch -l app.kubernetes.io/name=cloudwatch-agent \
                 -o jsonpath='{range .items[*]}{.metadata.name}{" -> "}{.spec.containers[0].env[?(@.name=="AWS_ROLE_ARN")].value}{"\n"}{end}'
               exit 0
             fi
 
-            echo "Attempt $attempt: cloudwatch-agent pods missing IRSA credentials: $missing"
+            if [ "${total:-0}" -eq 0 ]; then
+              echo "Attempt $attempt: no cloudwatch-agent pods found yet (DaemonSet may still be rolling out)."
+            else
+              echo "Attempt $attempt: $total pod(s) present, missing IRSA credentials: $missing"
+            fi
             echo "Restarting DaemonSet so the IRSA webhook re-injects credentials at admission."
             kubectl rollout restart daemonset/cloudwatch-agent -n amazon-cloudwatch
             kubectl rollout status daemonset/cloudwatch-agent -n amazon-cloudwatch --timeout=300s

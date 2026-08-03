@@ -263,9 +263,23 @@ jobs:
               # Assert only -- never restart the shared DaemonSet from a per-version job, since that
               # would drop sibling jobs' in-flight telemetry.
               
-              agent_missing_irsa=$(kubectl get pods -n amazon-cloudwatch -l app.kubernetes.io/name=cloudwatch-agent \
-                -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.spec.containers[0].env[?(@.name=="AWS_ROLE_ARN")].value}{"\n"}{end}' \
-                | awk -F'|' '$2==""{print $1}')
+              # Require POSITIVE proof: >=1 agent pod, every one carrying AWS_ROLE_ARN. Checking only
+              # for "no pods missing the var" would pass vacuously when kubectl errors or when zero
+              # agent pods exist -- both of which mean no telemetry.
+              agent_pods=$(kubectl get pods -n amazon-cloudwatch -l app.kubernetes.io/name=cloudwatch-agent \
+                -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.spec.containers[0].env[?(@.name=="AWS_ROLE_ARN")].value}{"\n"}{end}' 2>/dev/null) || {
+                  echo "::error::Could not query cloudwatch-agent pods in amazon-cloudwatch namespace."
+                  exit 1
+                }
+              agent_pods=$(printf '%s\n' "$agent_pods" | grep -v '^[[:space:]]*$' || true)
+              agent_total=$(printf '%s\n' "$agent_pods" | grep -c . || true)
+              if [ "${agent_total:-0}" -eq 0 ]; then
+                echo "::error::No cloudwatch-agent pods found. The CloudWatch agent is not running, so no"
+                echo "telemetry can reach CloudWatch. Shared setup (eks-setup-app-signals.yml) should have"
+                echo "installed the amazon-cloudwatch-observability addon before this job ran."
+                exit 1
+              fi
+              agent_missing_irsa=$(printf '%s\n' "$agent_pods" | awk -F'|' '$2==""{print $1}')
               if [ -n "$agent_missing_irsa" ]; then
                 echo "::error::cloudwatch-agent pods lack projected IRSA credentials: $agent_missing_irsa"
                 echo "The agent will authenticate as the EC2 node role and get AccessDeniedException on"
@@ -273,7 +287,7 @@ jobs:
                 echo "Shared setup (eks-setup-app-signals.yml) should have established this."
                 exit 1
               fi
-              echo "cloudwatch-agent has IRSA credentials projected."
+              echo "cloudwatch-agent has IRSA credentials projected ($agent_total pod(s))."
 
               # Inject THIS test's ADOT image the same way the sequential (main) flow does: patch the
               # operator's cluster-wide --auto-instrumentation-python-image arg. 

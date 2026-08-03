@@ -253,15 +253,27 @@ jobs:
                 "[ \"\$(aws eks describe-addon --cluster-name ${{ env.CLUSTER_NAME }} --addon-name amazon-cloudwatch-observability --region ${{ env.E2E_TEST_AWS_REGION }} --query 'addon.status' --output text)\" = ACTIVE ]" \
                 "" 20
 
-              agent_missing_irsa=$(kubectl get pods -n amazon-cloudwatch -l app.kubernetes.io/name=cloudwatch-agent \
-                -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.spec.containers[0].env[?(@.name=="AWS_ROLE_ARN")].value}{"\n"}{end}' \
-                | awk -F'|' '$2==""{print $1}')
+              # Require POSITIVE proof (>=1 pod, all with AWS_ROLE_ARN) -- an empty result from a failed
+              # kubectl call or a cold cluster would otherwise pass vacuously.
+              agent_pods=$(kubectl get pods -n amazon-cloudwatch -l app.kubernetes.io/name=cloudwatch-agent \
+                -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.spec.containers[0].env[?(@.name=="AWS_ROLE_ARN")].value}{"\n"}{end}' 2>/dev/null) || {
+                  echo "::error::Could not query cloudwatch-agent pods in amazon-cloudwatch namespace."
+                  exit 1
+                }
+              agent_pods=$(printf '%s\n' "$agent_pods" | grep -v '^[[:space:]]*$' || true)
+              agent_total=$(printf '%s\n' "$agent_pods" | grep -c . || true)
+              if [ "${agent_total:-0}" -eq 0 ]; then
+                echo "::error::No cloudwatch-agent pods found; the agent is not running so no telemetry"
+                echo "can reach CloudWatch. eks-setup-app-signals.yml should have installed the addon."
+                exit 1
+              fi
+              agent_missing_irsa=$(printf '%s\n' "$agent_pods" | awk -F'|' '$2==""{print $1}')
               if [ -n "$agent_missing_irsa" ]; then
                 echo "::error::cloudwatch-agent pods lack projected IRSA credentials: $agent_missing_irsa"
                 echo "Telemetry will not reach CloudWatch and validation will fail on missing data."
                 exit 1
               fi
-              echo "cloudwatch-agent has IRSA credentials projected."
+              echo "cloudwatch-agent has IRSA credentials projected ($agent_total pod(s))."
 
               # Restart pods so the now-installed operator injects ADOT instrumentation, then wait.
               execute_and_retry 2 "kubectl delete pods --all -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 60
