@@ -302,42 +302,77 @@ jobs:
                 deployment/amazon-cloudwatch-observability-controller-manager --timeout=180s \
                 || echo "Operator rollout wait timed out; continuing (injection is verified below)."
 
+              # After a rollout the operator pod can be Ready before its mutating webhook is actually
+              # serving. Pods admitted in that window come up WITHOUT the instrumentation init container,
+              # which then shows up as a readiness/injection failure here. Wait for the operator pod to be
+              # Ready and give the webhook a moment to start serving before recreating app pods. A
+              # concurrent job's patch (see "lost a concurrent write" above) can roll the operator again,
+              # so the inject_attempt loop below still re-verifies.
+              kubectl -n amazon-cloudwatch wait --for=condition=Ready --timeout=180s \
+                pod -l app.kubernetes.io/name=amazon-cloudwatch-observability \
+                || echo "Operator pod readiness wait timed out; continuing (injection is verified below)."
+              sleep 15
+
               # Restart this namespace's pods so the operator injects instrumentation, then verify the
               # auto-instrumentation init container is present with the target image. A pod can become
               # Ready WITHOUT being injected if the webhook was not serving when it was admitted; retry
               # the restart until injection takes effect (fail loudly rather than validate an
               # uninstrumented app).
+              # Wait on the instrumented app pods only (sample-app, remote-app). traffic-generator and
+              # mysql readiness is irrelevant to instrumentation: traffic-generator does not even get
+              # its MAIN_ENDPOINT/REMOTE_ENDPOINT until a later step, and the injection check below
+              # inspects app=sample-app.
+              #
+              # IMPORTANT: do NOT use execute_and_retry for these waits. That helper calls `exit 1` when
+              # its retries are exhausted (see .github/workflows/util/execute_and_retry.sh), which kills
+              # the whole job on the first slow rollout and makes the `inject_attempt` loop below
+              # unreachable past attempt 1 -- the loop was written to retry the restart, so it must be
+              # allowed to actually iterate. Use a plain non-fatal wait and let the loop decide.
               inject_verified=0
               for inject_attempt in 1 2 3 4 5; do
-                execute_and_retry 2 "kubectl delete pods --all -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 60
-                # Wait ONLY on the instrumented app pods (sample-app, remote-app) -- NOT `pod --all`.
-                #
-                # `pod --all` also waits on traffic-generator, which cannot become Ready at this point
-                # in the workflow: it only learns MAIN_ENDPOINT/REMOTE_ENDPOINT from the later
-                # "kubectl set env deployment/traffic-generator" step, which runs after the endpoint
-                # discovery steps further below. With no endpoints to hit, it restarts instead of going
-                # Ready, `kubectl wait` times out, and execute_and_retry's `exit 1` (see
-                # .github/workflows/util/execute_and_retry.sh) kills the whole job. That produced the
-                # intermittent "timed out waiting for the condition on pods/traffic-generator" failures
-                # where sample-app / remote-app / sql all reported "condition met".
-                #
-                # Only sample-app and remote-app readiness matters here: the injection check on the next
-                # line inspects app=sample-app, and both are the pods that must carry the
-                # auto-instrumentation init container. traffic-generator and mysql readiness is
-                # irrelevant to instrumentation and is covered by the endpoint checks later.
-                execute_and_retry 2 "kubectl wait --for=condition=Ready --request-timeout '5m' pod -l app=sample-app -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 10
-                execute_and_retry 2 "kubectl wait --for=condition=Ready --request-timeout '5m' pod -l app=remote-app -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 10
+                kubectl delete pods --all -n ${{ env.SAMPLE_APP_NAMESPACE }} || true
+
+                # Non-fatal waits: a timeout here is a retry signal, not a job-ending error.
+                wait_failed=0
+                kubectl wait --for=condition=Ready --request-timeout '5m' --timeout '5m' \
+                  pod -l app=sample-app -n ${{ env.SAMPLE_APP_NAMESPACE }} || wait_failed=1
+                kubectl wait --for=condition=Ready --request-timeout '5m' --timeout '5m' \
+                  pod -l app=remote-app -n ${{ env.SAMPLE_APP_NAMESPACE }} || wait_failed=1
+
+                # When pods do not come up, print WHY into the workflow log. Without this the only
+                # signal is "timed out waiting for the condition", which does not distinguish
+                # ImagePullBackOff (e.g. the cross-account/cross-region auto-instrumentation image) from
+                # CrashLoopBackOff from FailedScheduling/Insufficient memory. The pod Events and
+                # container statuses below identify the actual cause.
+                if [ "$wait_failed" -ne 0 ]; then
+                  echo "::group::Diagnostics for attempt $inject_attempt (pods did not become Ready)"
+                  kubectl get pods -n ${{ env.SAMPLE_APP_NAMESPACE }} -o wide || true
+                  echo "--- describe sample-app ---"
+                  kubectl describe pod -l app=sample-app -n ${{ env.SAMPLE_APP_NAMESPACE }} || true
+                  echo "--- describe remote-app ---"
+                  kubectl describe pod -l app=remote-app -n ${{ env.SAMPLE_APP_NAMESPACE }} || true
+                  echo "--- init container logs (auto-instrumentation) ---"
+                  kubectl logs -l app=sample-app -n ${{ env.SAMPLE_APP_NAMESPACE }} \
+                    -c opentelemetry-auto-instrumentation-java --tail=50 || true
+                  echo "--- app container logs ---"
+                  kubectl logs -l app=sample-app -n ${{ env.SAMPLE_APP_NAMESPACE }} \
+                    --all-containers --tail=50 || true
+                  echo "--- node capacity / allocation ---"
+                  kubectl describe nodes | grep -A 8 "Allocated resources" || true
+                  echo "::endgroup::"
+                fi
+
                 INJECTED_IMAGE=$(kubectl get pod -n ${{ env.SAMPLE_APP_NAMESPACE }} --selector=app=sample-app \
                   -o jsonpath='{.items[0].spec.initContainers[?(@.name=="opentelemetry-auto-instrumentation-java")].image}' 2>/dev/null || true)
-                if [ "$INJECTED_IMAGE" = "${{ env.PATCH_IMAGE_ARN }}" ]; then
+                if [ "$wait_failed" -eq 0 ] && [ "$INJECTED_IMAGE" = "${{ env.PATCH_IMAGE_ARN }}" ]; then
                   echo "Instrumentation injected with target image on attempt $inject_attempt: $INJECTED_IMAGE"
                   inject_verified=1
                   break
                 fi
-                echo "Not injected with target image yet on attempt $inject_attempt (got: '${INJECTED_IMAGE:-none}'); retrying restart..."
+                echo "Attempt $inject_attempt incomplete (wait_failed=$wait_failed, image='${INJECTED_IMAGE:-none}'); retrying restart..."
                 sleep 20
               done
-              if [ "$inject_verified" -ne 1 ]; then echo "Instrumentation never injected with the target image."; exit 1; fi
+              if [ "$inject_verified" -ne 1 ]; then echo "Pods never became Ready with the target instrumentation image."; exit 1; fi
             fi
           
             # If the deployment_failed is 1 then either the terraform deployment or the endpoint connection failed, so first destroy the
