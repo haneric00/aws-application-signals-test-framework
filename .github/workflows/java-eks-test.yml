@@ -249,26 +249,50 @@ jobs:
             # after installing App Signals. Attempts to connect will be made for up to 10 minutes
             if [ $deployment_failed -eq 0 ]; then
               . ${{ env.TEST_RESOURCES_FOLDER }}/.github/workflows/util/execute_and_retry.sh
-              # Install the cluster-wide Application Signals addon. This is idempotent: the first
-              # parallel version job installs it, the rest see it already present. Do NOT pass a
-              # clean-up command here — deleting the shared addon would break other parallel jobs and
-              # can leave the CloudWatch agent without its IRSA role (dropping telemetry cluster-wide).
-              execute_and_retry 3 \
-              "${{ env.TEST_RESOURCES_FOLDER }}/enablement-script/enable-app-signals.sh \
-              ${{ env.CLUSTER_NAME }} \
-              ${{ env.E2E_TEST_AWS_REGION }} \
-              ${{ env.SAMPLE_APP_NAMESPACE }}" \
-              "" \
-              60
 
+              # Do NOT run enable-app-signals.sh here. It calls
+              # `eksctl create iamserviceaccount --override-existing-serviceaccounts` UNCONDITIONALLY
+              # (only the addon install is guarded by an "already exists" check), so when parallel
+              # version jobs each ran it, a sibling could delete and recreate the shared
+              # cloudwatch-agent service account AFTER the addon's DaemonSet pods were admitted.
+              # IRSA credentials are injected by a mutating webhook at pod-admission time ONLY, so
+              # those pods ran with no AWS_ROLE_ARN for their whole lifetime, fell back to the EC2
+              # node role (which has no logs:PutLogEvents), and returned AccessDeniedException on
+              # every export -- dropping every parallel job's telemetry and failing all validators
+              # with "list is empty or null" on missing data.
+              #
+              # Cluster-wide setup now happens exactly once, before this fan-out, in
+              # eks-setup-app-signals.yml (gated by the caller). Here we only ASSERT that shared
+              # state is healthy -- no mutation of shared resources. Self-healing (restarting the
+              # agent DaemonSet) belongs only in the pipeline-scoped setup job: doing it per-job
+              # would itself be a new race that drops siblings' in-flight telemetry.
               aws eks update-kubeconfig --region ${{ env.E2E_TEST_AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
 
-              # enable-app-signals.sh returns while the addon is still CREATING. The operator that
-              # performs injection is deployed by the addon, so wait for the addon to reach ACTIVE
-              # before patching it below — otherwise the patch/rollout races the install.
+              # Assert the addon is ACTIVE. Short retry only to absorb an eks-setup rollout tail;
+              # this must NOT install anything.
               execute_and_retry 30 \
                 "[ \"\$(aws eks describe-addon --cluster-name ${{ env.CLUSTER_NAME }} --addon-name amazon-cloudwatch-observability --region ${{ env.E2E_TEST_AWS_REGION }} --query 'addon.status' --output text)\" = ACTIVE ]" \
                 "" 20
+
+              # Assert the CloudWatch agent actually has IRSA credentials projected. Addon ACTIVE does
+              # NOT imply this -- ACTIVE only means the addon reconciled, it says nothing about whether
+              # the DaemonSet pods won the injection race. Failing fast here with a clear message beats
+              # timing out in a validator ~30 minutes later on absent telemetry.
+              agent_pods=$(kubectl get pods -n amazon-cloudwatch -l app.kubernetes.io/name=cloudwatch-agent \
+                -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.spec.containers[0].env[?(@.name=="AWS_ROLE_ARN")].value}{"\n"}{end}' 2>/dev/null) || agent_pods=""
+              agent_pods=$(printf '%s\n' "$agent_pods" | grep -v '^[[:space:]]*$' || true)
+              agent_total=$(printf '%s\n' "$agent_pods" | grep -c . || true)
+              agent_missing=$(printf '%s\n' "$agent_pods" | awk -F'|' '$2==""{print $1}')
+              if [ "${agent_total:-0}" -eq 0 ] || [ -n "$agent_missing" ]; then
+                echo "::error::cloudwatch-agent is not healthy: total=${agent_total:-0} missing_IRSA='${agent_missing}'."
+                echo "The agent would authenticate as the EC2 node role and get AccessDeniedException on"
+                echo "logs:PutLogEvents, so every validator in this run would fail on missing telemetry."
+                echo "Cluster-wide setup is owned by eks-setup-app-signals.yml -- ensure the caller runs it"
+                echo "and that all EKS jobs are gated on it. Do not 'fix' this by restarting the agent here:"
+                echo "that would drop sibling parallel jobs' in-flight telemetry."
+                exit 1
+              fi
+              echo "cloudwatch-agent healthy: $agent_total pod(s) with AWS_ROLE_ARN projected."
 
               # Inject THIS test's ADOT image by patching the operator's cluster-wide
               # --auto-instrumentation-java-image arg. Every java version job injects the SAME
