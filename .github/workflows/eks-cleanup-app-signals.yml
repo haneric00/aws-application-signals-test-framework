@@ -24,14 +24,30 @@ on:
         required: false
         type: string
         default: 'us-east-1'
+  # Manual escape hatch. End-of-pipeline cleanup can fail for reasons unrelated to the tests (OIDC
+  # assume-role flakiness, runner eviction, cancellation). Without a standalone trigger the ONLY way to
+  # retry was re-running the whole multi-hour pipeline, so a dirty cluster tended to just stay dirty.
+  # Dispatch this directly to force teardown of a cluster left warm by a failed run.
+  workflow_dispatch:
+    inputs:
+      test-cluster-name:
+        description: 'EKS cluster to tear down App Signals from'
+        required: false
+        type: string
+        default: 'e2e-python-adot-test'
+      aws-region:
+        required: false
+        type: string
+        default: 'us-east-1'
 
 permissions:
   id-token: write
   contents: read
 
 env:
-  CLUSTER_NAME: ${{ inputs.test-cluster-name }}
-  E2E_TEST_AWS_REGION: ${{ inputs.aws-region }}
+  # Fallbacks so a manual workflow_dispatch run works even with inputs left blank.
+  CLUSTER_NAME: ${{ inputs.test-cluster-name || 'e2e-python-adot-test' }}
+  E2E_TEST_AWS_REGION: ${{ inputs.aws-region || 'us-east-1' }}
   E2E_TEST_ACCOUNT_ID: ${{ secrets.APPLICATION_SIGNALS_E2E_TEST_ACCOUNT_ID }}
   E2E_TEST_ROLE_NAME: ${{ secrets.APPLICATION_SIGNALS_E2E_TEST_ROLE_NAME }}
 
@@ -41,14 +57,53 @@ jobs:
     # needs:) on all EKS jobs finishing, so it is still exclusive.
     if: ${{ always() }}
     runs-on: ubuntu-latest
+    # Bound the whole job. Without this, a wedged credential step hangs until GitHub's 6-hour default,
+    # blocking the pipeline AND leaving the cluster dirty. 20 minutes is ample for teardown.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
+      # Bounded + retried. This job runs LAST, hours into a pipeline, so OIDC assume-role is the most
+      # likely thing to go transiently wrong here (observed: 26 minutes of "Assuming role with OIDC"
+      # retries with no progress). An unbounded hang here means the cluster is never cleaned, so give
+      # it a hard ceiling and two more chances rather than letting it wedge.
       - name: Configure AWS Credentials
+        id: creds
+        continue-on-error: true
+        timeout-minutes: 4
         uses: aws-actions/configure-aws-credentials@a03048d87541d1d9fcf2ecf528a4a65ba9bd7838 # v5.0.0
         with:
           role-to-assume: arn:aws:iam::${{ env.E2E_TEST_ACCOUNT_ID }}:role/${{ env.E2E_TEST_ROLE_NAME }}
           aws-region: ${{ env.E2E_TEST_AWS_REGION }}
+
+      - name: Retry AWS Credentials (attempt 2)
+        id: creds2
+        if: steps.creds.outcome == 'failure'
+        continue-on-error: true
+        timeout-minutes: 4
+        uses: aws-actions/configure-aws-credentials@a03048d87541d1d9fcf2ecf528a4a65ba9bd7838 # v5.0.0
+        with:
+          role-to-assume: arn:aws:iam::${{ env.E2E_TEST_ACCOUNT_ID }}:role/${{ env.E2E_TEST_ROLE_NAME }}
+          aws-region: ${{ env.E2E_TEST_AWS_REGION }}
+
+      - name: Retry AWS Credentials (attempt 3)
+        if: steps.creds.outcome == 'failure' && steps.creds2.outcome == 'failure'
+        timeout-minutes: 4
+        uses: aws-actions/configure-aws-credentials@a03048d87541d1d9fcf2ecf528a4a65ba9bd7838 # v5.0.0
+        with:
+          role-to-assume: arn:aws:iam::${{ env.E2E_TEST_ACCOUNT_ID }}:role/${{ env.E2E_TEST_ROLE_NAME }}
+          aws-region: ${{ env.E2E_TEST_AWS_REGION }}
+
+      # Fail loudly if the cluster could not be cleaned. A silent green here is how state leaks.
+      - name: Assert credentials are usable
+        run: |
+          if ! aws sts get-caller-identity >/dev/null 2>&1; then
+            echo "::error::Could not assume the E2E test role after 3 attempts, so the shared cluster"
+            echo "was NOT cleaned up. It will stay warm and the next pipeline will not cold-start."
+            echo "Re-run this job, or tear down manually with clean-app-signals.sh."
+            exit 1
+          fi
+          aws sts get-caller-identity --query 'Arn' --output text
 
       - name: Download cleanup script
         run: |

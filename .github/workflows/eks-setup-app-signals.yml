@@ -108,16 +108,49 @@ jobs:
           rm -f eksctl_Linux_amd64.tar.gz
           eksctl version
 
-      # Safety guard: mirror of the cleanup job's guard. If sample-app namespaces are present, another
-      # run is using the cluster; recreating the shared SA now is exactly the hazard this job prevents.
-      - name: Warn if tests are already running
+      # Reap leftovers from a PREVIOUS run before establishing shared state.
+      #
+      # End-of-pipeline cleanup is best-effort: it can fail on transient OIDC/STS errors, runner
+      # eviction, or cancellation, leaving the cluster warm and dirty. Rather than trusting that
+      # teardown always succeeded, setup makes the cluster clean itself. Cleanup remains the primary
+      # mechanism (it frees resources promptly); this is the backstop that guarantees a correct starting
+      # state even when cleanup didn't run.
+      #
+      # Safe because setup runs before any test job in this pipeline, and both entry points to this
+      # cluster are serialized by `concurrency: cancel-in-progress: false` -- so any ns-* found here is
+      # a leftover, not a live test.
+      - name: Reap leftovers from previous runs
+        timeout-minutes: 10
         run: |
-          active=$(kubectl get namespace -o name 2>/dev/null | grep -E 'namespace/ns-' || true)
-          if [ -n "$active" ]; then
-            echo "::warning::Active test namespaces present while setting up shared App Signals state:"
-            echo "$active"
+          stale=$(kubectl get namespace -o name 2>/dev/null | grep -E 'namespace/ns-' | sed 's#namespace/##' || true)
+          if [ -z "$stale" ]; then
+            echo "No leftover test namespaces."
           else
-            echo "No active test namespaces; safe to set up App Signals."
+            echo "::warning::Leftover namespaces from a previous run (cleanup did not complete):"
+            echo "$stale"
+            for ns in $stale; do
+              kubectl delete namespace "$ns" --ignore-not-found --timeout=180s || \
+                echo "::warning::Namespace $ns did not delete cleanly; continuing."
+            done
+          fi
+
+          # Sweep orphaned eksctl IRSA CFN stacks so the create below starts from a known state.
+          orphans=$(aws cloudformation describe-stacks --region "${{ env.E2E_TEST_AWS_REGION }}" \
+            --query "Stacks[?contains(StackName, 'eksctl-${{ env.CLUSTER_NAME }}-addon-iamserviceaccount-amazon-cloudwatch')].StackName" \
+            --output text 2>/dev/null || true)
+          if [ -n "$orphans" ] && [ "$orphans" != "None" ]; then
+            for st in $orphans; do
+              # Only sweep stacks whose SA is already gone; a live SA means the stack is legitimately in use.
+              if ! kubectl get sa cloudwatch-agent -n amazon-cloudwatch >/dev/null 2>&1; then
+                echo "Deleting orphaned IRSA stack (no matching service account): $st"
+                aws cloudformation delete-stack --region "${{ env.E2E_TEST_AWS_REGION }}" --stack-name "$st" || \
+                  echo "::warning::Could not delete stack $st"
+                aws cloudformation wait stack-delete-complete --region "${{ env.E2E_TEST_AWS_REGION }}" \
+                  --stack-name "$st" 2>/dev/null || true
+              else
+                echo "Stack $st has a live cloudwatch-agent SA; leaving it alone."
+              fi
+            done
           fi
 
       # Retries are implemented inline rather than sourcing .github/workflows/util/execute_and_retry.sh
