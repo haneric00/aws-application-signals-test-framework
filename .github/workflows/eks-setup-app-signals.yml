@@ -6,25 +6,6 @@
 # This is the mirror image of eks-cleanup-app-signals.yml. The caller invokes this FIRST, and gates
 # every EKS test job on it, so that installing the shared amazon-cloudwatch-observability addon and
 # the cloudwatch-agent IRSA service account happens EXACTLY ONCE while nothing else uses the cluster.
-#
-# Why this job exists (the IRSA injection race):
-#   enable-app-signals.sh runs `eksctl create iamserviceaccount --override-existing-serviceaccounts`
-#   UNCONDITIONALLY on every invocation -- that step is not guarded by an "already present" check the
-#   way the addon install is. When N parallel version jobs each ran the script, a sibling job could
-#   delete and recreate the cloudwatch-agent service account AFTER the addon's DaemonSet pods had
-#   already been admitted. IRSA credentials are injected by a mutating webhook at pod-admission time
-#   ONLY, so those pods kept running with no AWS_ROLE_ARN / no aws-iam-token volume, silently fell
-#   back to the EC2 node role (which has no logs:PutLogEvents), and returned AccessDeniedException
-#   for their entire lifetime. Every parallel job's telemetry was then dropped and all validators
-#   failed on missing data.
-#
-#   The race is nondeterministic -- whoever wins the interleaving decides whether a run is green --
-#   which is why it presented as flaky and appeared "fixed" on branches that reused a warm cluster.
-#   Because eks-cleanup-app-signals.yml tears the addon down at the END of every pipeline, main
-#   re-enters this race on every single run, while a feature branch that never ran cleanup cold-started
-#   at most once and then inherited a warm, already-credentialed cluster.
-#
-# Serializing setup here removes the race by construction rather than retrying around it.
 name: EKS Setup Application Signals
 
 on:
@@ -54,14 +35,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      # Must explicitly check out the FRAMEWORK repo. A bare actions/checkout in a reusable workflow
-      # clones the CALLER repo (aws-otel-python-instrumentation), which has no
-      # .github/workflows/util/execute_and_retry.sh.
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: 'aws-observability/aws-application-signals-test-framework'
-          # TESTING PIN — REVERT to 'main' before merge.
-          ref: 'fix-eks-irsa-setup-race'
+          ref: 'main'
           fetch-depth: 0
 
       - name: Configure AWS Credentials
@@ -88,11 +65,6 @@ jobs:
           wget -q https://raw.githubusercontent.com/aws-observability/application-signals-demo/main/scripts/eks/appsignals/enable-app-signals.sh
           chmod +x enable-app-signals.sh
 
-      # enable-app-signals.sh has an interactive `read -p` on the addon-upgrade path (fires when the
-      # addon exists but predates v1.4.0). With no stdin in CI that silently takes the "Aborted
-      # upgrading" branch, leaving a stale addon. Feed it "yes" via stdin at call time instead of
-      # patching the script. (The log-group deletion line lives only in clean-app-signals.sh, so no
-      # sed is needed here.)
       - name: Show enablement script version info
         working-directory: enablement-script
         run: grep -n "read -p" enable-app-signals.sh || echo "No interactive prompt in this revision."
@@ -109,16 +81,6 @@ jobs:
           eksctl version
 
       # Reap leftovers from a PREVIOUS run before establishing shared state.
-      #
-      # End-of-pipeline cleanup is best-effort: it can fail on transient OIDC/STS errors, runner
-      # eviction, or cancellation, leaving the cluster warm and dirty. Rather than trusting that
-      # teardown always succeeded, setup makes the cluster clean itself. Cleanup remains the primary
-      # mechanism (it frees resources promptly); this is the backstop that guarantees a correct starting
-      # state even when cleanup didn't run.
-      #
-      # Safe because setup runs before any test job in this pipeline, and both entry points to this
-      # cluster are serialized by `concurrency: cancel-in-progress: false` -- so any ns-* found here is
-      # a leftover, not a live test.
       - name: Reap leftovers from previous runs
         timeout-minutes: 10
         run: |
@@ -174,8 +136,6 @@ jobs:
           echo "::error::enable-app-signals.sh failed after 3 attempts."
           exit 1
 
-      # enable-app-signals.sh returns as soon as the addon is REQUESTED. The operator is not serving
-      # until the addon is ACTIVE.
       - name: Wait for addon to become ACTIVE
         run: |
           for attempt in $(seq 1 30); do
@@ -198,11 +158,6 @@ jobs:
           echo "::error::Addon did not become ACTIVE within ~10 minutes."
           exit 1
 
-      # ADDON ACTIVE DOES NOT IMPLY THE AGENT HAS CREDENTIALS. The addon reconciling only means its
-      # resources exist; it says nothing about whether the DaemonSet pods were admitted while the
-      # cloudwatch-agent service account carried its eks.amazonaws.com/role-arn annotation. Assert the
-      # projected identity is actually present, and bounce the DaemonSet if it is not. This is safe
-      # here (and ONLY here) because no test job is running yet, so no in-flight telemetry can be lost.
       - name: Verify cloudwatch-agent has IRSA credentials projected
         run: |
           # Tolerate failure here: on a freshly created addon the DaemonSet may not exist yet. The

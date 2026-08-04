@@ -5,13 +5,7 @@
 #
 # This restores the original (pre-parallelization) cleanup behavior — tear down App Signals after the
 # tests — but in a way that is safe for the parallel model. clean-app-signals.sh deletes the shared
-# amazon-cloudwatch-observability addon and the cloudwatch-agent IRSA service account; doing that
-# while EKS test jobs are running breaks them (agent loses IRSA -> AccessDenied -> dropped telemetry).
-#
-# The caller invokes this LAST, gated on every EKS job (all eks-py* and service-events-eks), so it
-# runs only when nothing else is using the cluster — the same exclusivity that made enable/clean safe
-# in the old sequential design. The next pipeline run's first EKS job reinstalls App Signals via
-# enable-app-signals.sh, exactly as before.
+# amazon-cloudwatch-observability addon and the cloudwatch-agent IRSA service account.
 name: EKS Cleanup Application Signals
 
 on:
@@ -24,10 +18,6 @@ on:
         required: false
         type: string
         default: 'us-east-1'
-  # Manual escape hatch. End-of-pipeline cleanup can fail for reasons unrelated to the tests (OIDC
-  # assume-role flakiness, runner eviction, cancellation). Without a standalone trigger the ONLY way to
-  # retry was re-running the whole multi-hour pipeline, so a dirty cluster tended to just stay dirty.
-  # Dispatch this directly to force teardown of a cluster left warm by a failed run.
   workflow_dispatch:
     inputs:
       test-cluster-name:
@@ -53,20 +43,11 @@ env:
 
 jobs:
   eks-cleanup-app-signals:
-    # always() so cleanup runs even if an upstream test job failed — but it is gated (via the caller's
-    # needs:) on all EKS jobs finishing, so it is still exclusive.
     if: ${{ always() }}
     runs-on: ubuntu-latest
-    # Bound the whole job. Without this, a wedged credential step hangs until GitHub's 6-hour default,
-    # blocking the pipeline AND leaving the cluster dirty. 20 minutes is ample for teardown.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-
-      # Bounded + retried. This job runs LAST, hours into a pipeline, so OIDC assume-role is the most
-      # likely thing to go transiently wrong here (observed: 26 minutes of "Assuming role with OIDC"
-      # retries with no progress). An unbounded hang here means the cluster is never cleaned, so give
-      # it a hard ceiling and two more chances rather than letting it wedge.
       - name: Configure AWS Credentials
         id: creds
         continue-on-error: true
@@ -124,17 +105,6 @@ jobs:
           eksctl version
 
       # Reap every leftover sample-app namespace, then tear down shared state unconditionally.
-      #
-      # This job is gated `needs: [every EKS job] + if: always()`, so it runs last in its pipeline even
-      # when jobs fail. Both entry points into this cluster (main-build and the E2E caller) declare
-      # `concurrency:` with cancel-in-progress: false, so a second pipeline QUEUES rather than
-      # overlapping -- there is no concurrent run to protect when we get here.
-      #
-      # The previous version skipped teardown (exit 0) whenever any ns-* namespace existed. A job that
-      # died before its own terraform destroy / namespace delete (e.g. a `kubectl wait` timeout) left an
-      # orphan namespace behind, which then tripped that guard and silently skipped teardown while
-      # REPORTING SUCCESS. The cluster stayed warm, so the next pipeline never cold-started and the
-      # leaked namespace persisted indefinitely. Leaking state is worse than reaping it here.
       - name: Reap leftover test namespaces
         timeout-minutes: 15
         run: |
@@ -162,9 +132,6 @@ jobs:
             ${{ env.E2E_TEST_AWS_REGION }} \
             default || echo "::warning::clean-app-signals.sh exited non-zero; verifying actual state below."
 
-      # Belt-and-braces: clean-app-signals.sh is best-effort, so assert the cluster is genuinely cold
-      # and sweep anything it missed. Without this, a partial teardown leaves the next pipeline warm --
-      # which is exactly how the IRSA race stayed hidden (a warm cluster never re-runs cold-start setup).
       - name: Verify cluster is cold and sweep remnants
         timeout-minutes: 15
         run: |

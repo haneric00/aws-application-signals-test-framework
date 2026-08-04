@@ -77,11 +77,7 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: 'aws-observability/aws-application-signals-test-framework'
-          # TESTING PIN — checks out the IRSA-fix branch's terraform/scripts/validators instead of
-          # 'main' when driven by main-build. REVERT to
-          #   ref: ${{ inputs.caller-workflow-name == 'main-build' && 'main' || github.ref }}
-          # before merge.
-          ref: ${{ inputs.caller-workflow-name == 'main-build' && 'fix-eks-irsa-setup-race' || github.ref }}
+          ref: ${{ inputs.caller-workflow-name == 'main-build' && 'main' || github.ref }}
           fetch-depth: 0
 
         # We initialize Gradlew Daemon early on during the workflow because sometimes initialization
@@ -258,14 +254,6 @@ jobs:
                 "[ \"\$(aws eks describe-addon --cluster-name ${{ env.CLUSTER_NAME }} --addon-name amazon-cloudwatch-observability --region ${{ env.E2E_TEST_AWS_REGION }} --query 'addon.status' --output text)\" = ACTIVE ]" \
                 "" 20
 
-              # Fail fast with a clear message if the agent lacks projected IRSA credentials. Without
-              # this the only symptom is a validator timing out on missing telemetry 30 minutes later.
-              # Assert only -- never restart the shared DaemonSet from a per-version job, since that
-              # would drop sibling jobs' in-flight telemetry.
-              
-              # Require POSITIVE proof: >=1 agent pod, every one carrying AWS_ROLE_ARN. Checking only
-              # for "no pods missing the var" would pass vacuously when kubectl errors or when zero
-              # agent pods exist -- both of which mean no telemetry.
               agent_pods=$(kubectl get pods -n amazon-cloudwatch -l app.kubernetes.io/name=cloudwatch-agent \
                 -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.spec.containers[0].env[?(@.name=="AWS_ROLE_ARN")].value}{"\n"}{end}' 2>/dev/null) || {
                   echo "::error::Could not query cloudwatch-agent pods in amazon-cloudwatch namespace."
@@ -288,22 +276,7 @@ jobs:
                 exit 1
               fi
               echo "cloudwatch-agent has IRSA credentials projected ($agent_total pod(s))."
-
-              # Inject THIS test's ADOT image the same way the sequential (main) flow does: patch the
-              # operator's cluster-wide --auto-instrumentation-python-image arg. 
-              #
-              # Every python version job injects the SAME adot-image-name (the single staging image 
-              # under test; the version differences live in the sample-app image, not the instrumentation image).
-              # So the shared operator arg is a value all jobs agree on. We only patch + roll out if the arg is not
-              # already the target value, so the first job patches and the rest no-op. We restart ONLY
-              # the operator deployment — never the shared cloudwatch-agent, whose restart would drop
-              # other parallel jobs' in-flight telemetry.
-              #
-              # Concurrency: multiple version jobs may reach this at once. A `get | jq | apply` pipeline
-              # carries the read resourceVersion and loses to a sibling job's concurrent write with
-              # "Operation cannot be fulfilled ... the object has been modified". Since every job writes
-              # the SAME target image, we retry: re-read each attempt, treat "already target" as done,
-              # and only patch when it differs. 
+ 
               patched=0
               for patch_attempt in 1 2 3 4 5 6; do
                 CURRENT_PY_IMAGE=$(kubectl get deploy -n amazon-cloudwatch amazon-cloudwatch-observability-controller-manager \
@@ -330,18 +303,10 @@ jobs:
                 exit 1
               fi
 
-              # Wait for the operator to be rolled out and serving before restarting pods. Otherwise
-              # pods can come up Ready but WITHOUT instrumentation injected (uninstrumented app -> zero
-              # telemetry -> empty validator results). The injection-verification loop below is the
-              # authoritative gate if the rollout status is slow.
               kubectl -n amazon-cloudwatch rollout status \
                 deployment/amazon-cloudwatch-observability-controller-manager --timeout=180s \
                 || echo "Operator rollout wait timed out; continuing (injection is verified below)."
 
-              # Restart this namespace's pods so the operator injects instrumentation, then VERIFY
-              # injection took effect with the CORRECT (patched) image. If the auto-
-              # instrumentation init container is missing, or still carries a non-target image, we
-              # restart again until it appears with the patched image.
               inject_verified=0
               for inject_attempt in 1 2 3 4 5; do
                 execute_and_retry 2 "kubectl delete pods --all -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 60
