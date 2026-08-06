@@ -1,26 +1,6 @@
 ## Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 ## SPDX-License-Identifier: Apache-2.0
 
-# Reusable workflow: Application Signals Python EKS test, PARALLEL variant.
-#
-# Sibling of python-eks-test.yml, NOT a replacement. python-eks-test.yml stays sequential and is
-# consumed by other repos (amazon-cloudwatch-agent, amazon-cloudwatch-agent-operator); this file is
-# consumed only by callers that fan out 5 Python version jobs CONCURRENTLY on one shared cluster
-# (aws-otel-python-instrumentation). The two share no files, so changes here cannot affect them.
-#
-# Why a separate workflow instead of parallelizing the shared one:
-#   Sequential callers own the cluster during their run, so installing/tearing down App Signals
-#   inside the test is safe. Running versions in parallel removes that exclusivity and turns those
-#   in-test calls into races (enable-app-signals.sh recreates the shared cloudwatch-agent IRSA
-#   service account unconditionally; a sibling doing so after this job's agent pods were admitted
-#   strips their credentials, since IRSA injects only at pod-admission time -> AccessDenied on
-#   PutLogEvents -> dropped telemetry). So cluster-wide state is owned by pipeline-scoped bookends:
-#     eks-setup-app-signals.yml    installs addon + IRSA SA once, before the fan-out
-#     eks-cleanup-app-signals.yml  tears it down once, after every EKS job
-#   This workflow only ASSERTS shared state is healthy; it must never install/clean App Signals,
-#   restart the shared cloudwatch-agent DaemonSet, or bulk-delete ns-* namespaces.
-#
-# Read more about reusable workflows: https://docs.github.com/en/actions/using-workflows/reusing-workflows#overview
 name: Python EKS Use Case (Parallel)
 on:
   workflow_call:
@@ -42,9 +22,6 @@ on:
       adot-image-name:
         required: false
         type: string
-      cw-agent-operator-tag:
-        required: false
-        type: string
     outputs:
       job-started:
         value: ${{ jobs.python-eks.outputs.job-started }}
@@ -61,7 +38,6 @@ env:
   CALLER_WORKFLOW_NAME: ${{ inputs.caller-workflow-name }}
   PYTHON_VERSION: ${{ inputs.python-version }}
   ADOT_IMAGE_NAME: ${{ inputs.adot-image-name }}
-  CW_AGENT_OPERATOR_TAG: ${{ inputs.cw-agent-operator-tag }}
   E2E_TEST_ACCOUNT_ID: ${{ secrets.APPLICATION_SIGNALS_E2E_TEST_ACCOUNT_ID }}
   E2E_TEST_ROLE_NAME: ${{ secrets.APPLICATION_SIGNALS_E2E_TEST_ROLE_NAME }}
   METRIC_NAMESPACE: ApplicationSignals
@@ -122,23 +98,6 @@ jobs:
           max_retry: 3
           sleep_time: 60
 
-      - name: Download enablement script
-        uses: ./.github/workflows/actions/execute_and_retry
-        with:
-          pre-command: "mkdir enablement-script && cd enablement-script"
-          command: "wget https://raw.githubusercontent.com/aws-observability/application-signals-demo/main/scripts/eks/appsignals/enable-app-signals.sh 
-          && wget https://raw.githubusercontent.com/aws-observability/application-signals-demo/main/scripts/eks/appsignals/clean-app-signals.sh"
-          cleanup: "rm -f enable-app-signals.sh && rm -f clean-app-signals.sh"
-          post-command: "chmod +x enable-app-signals.sh && chmod +x clean-app-signals.sh"
-
-      # We do not want to delete the log group as it contains logs from other sources as well as information that could help us diagnose if the workflow run fails
-      - name: Remove log group deletion command
-        if: always()
-        working-directory: enablement-script
-        run: |
-          delete_log_group="aws logs delete-log-group --log-group-name '${{ env.LOG_GROUP_NAME }}' --region \$REGION"
-          sed -i "s#$delete_log_group##g" clean-app-signals.sh
-
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@a03048d87541d1d9fcf2ecf528a4a65ba9bd7838 # v5.0.0
         with:
@@ -153,13 +112,6 @@ jobs:
             PYTHON_MAIN_SAMPLE_APP_IMAGE, e2e-test/python-main-sample-app-image
             PYTHON_REMOTE_SAMPLE_APP_IMAGE, e2e-test/python-remote-sample-app-image
 
-      # If the workflow is running as a canary, then we want to log in to the aws account in the appropriate region
-      - name: Configure AWS Credentials
-        if: ${{ env.REPOSITORY_NAME == 'aws-application-signals-test-framework' }}
-        uses: aws-actions/configure-aws-credentials@a03048d87541d1d9fcf2ecf528a4a65ba9bd7838 # v5.0.0
-        with:
-          role-to-assume: arn:aws:iam::${{ env.ACCOUNT_ID }}:role/${{ env.E2E_TEST_ROLE_NAME }}
-          aws-region: ${{ env.E2E_TEST_AWS_REGION }}
 
       # local directory to store the kubernetes config
       - name: Create kubeconfig directory
@@ -230,16 +182,15 @@ jobs:
             echo REMOTE_SAMPLE_APP_IMAGE_ARN="${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.E2E_TEST_AWS_REGION }}.amazonaws.com/${{ env.PYTHON_REMOTE_SAMPLE_APP_IMAGE }}:v${{ env.PYTHON_VERSION }}" >> "$GITHUB_ENV"
 
       # The ADOT image this test injects. Set BEFORE deploy so the Instrumentation CR created in the
-      # deploy step can reference it. For the python repo this is the staging image under test.
+      # deploy step can reference it. This is the staging image under test, passed in by the caller
+      # (aws-otel-python-instrumentation) via the adot-image-name input.
       - name: Determine ADOT image to inject
         run: |
-          if [ "${{ env.REPOSITORY_NAME }}" = "amazon-cloudwatch-agent" ]; then
-            echo PATCH_IMAGE_ARN="${{ secrets.AWS_ECR_PRIVATE_REGISTRY }}/cwagent-integration-test:${{ github.sha }}" >> "$GITHUB_ENV"
-          elif [ "${{ env.REPOSITORY_NAME }}" = "amazon-cloudwatch-agent-operator" ]; then
-            echo PATCH_IMAGE_ARN="${{ vars.ECR_OPERATOR_STAGING_REPO }}:${{ env.CW_AGENT_OPERATOR_TAG }}" >> "$GITHUB_ENV"
-          elif [ "${{ env.REPOSITORY_NAME }}" = "aws-otel-python-instrumentation" ]; then
-            echo PATCH_IMAGE_ARN="${{ env.ADOT_IMAGE_NAME }}" >> "$GITHUB_ENV"
+          if [ -z "${{ env.ADOT_IMAGE_NAME }}" ]; then
+            echo "::error::adot-image-name input is empty; nothing to inject."
+            exit 1
           fi
+          echo PATCH_IMAGE_ARN="${{ env.ADOT_IMAGE_NAME }}" >> "$GITHUB_ENV"
 
       - name: Deploy sample app via terraform and wait for the endpoint to come online
         id: deploy-python-app
@@ -480,13 +431,6 @@ jobs:
           --query-string ip=${{ env.REMOTE_SERVICE_POD_IP }}&testingId=${{ env.TESTING_ID }}
           --rollup'
 
-      - name: Refresh AWS Credentials
-        if: ${{ env.REPOSITORY_NAME == 'aws-application-signals-test-framework' }}
-        uses: aws-actions/configure-aws-credentials@a03048d87541d1d9fcf2ecf528a4a65ba9bd7838 # v5.0.0
-        with:
-          role-to-assume: arn:aws:iam::${{ env.ACCOUNT_ID }}:role/${{ env.E2E_TEST_ROLE_NAME }}
-          aws-region: ${{ env.E2E_TEST_AWS_REGION }}
-
       - name: Save test results
         if: always()
         id: validation-result
@@ -498,10 +442,6 @@ jobs:
           fi
 
       # Clean up Procedures
-      # NOTE: the cluster-wide Application Signals addon is intentionally NOT removed here — it is
-      # shared by the other parallel version jobs and persists on the long-lived test cluster.
-      # This job cleans up only its own namespace (which also deletes its Instrumentation CR).
-
       - name: Delete this version's sample app namespace
         if: always()
         continue-on-error: true

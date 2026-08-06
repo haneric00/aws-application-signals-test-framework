@@ -2,10 +2,6 @@
 ## SPDX-License-Identifier: Apache-2.0
 
 # End-of-pipeline teardown of Application Signals from a shared EKS test cluster.
-#
-# This restores the original (pre-parallelization) cleanup behavior — tear down App Signals after the
-# tests — but in a way that is safe for the parallel model. clean-app-signals.sh deletes the shared
-# amazon-cloudwatch-observability addon and the cloudwatch-agent IRSA service account.
 name: EKS Cleanup Application Signals
 
 on:
@@ -95,8 +91,6 @@ jobs:
       - name: Set up kubeconfig
         run: aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.E2E_TEST_AWS_REGION }}
 
-      # clean-app-signals.sh calls `eksctl delete iamserviceaccount` to remove the cloudwatch-agent
-      # IRSA service account, so eksctl must be on PATH.
       - name: Install eksctl
         run: |
           curl -sLO "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz"
@@ -135,7 +129,6 @@ jobs:
       - name: Verify cluster is cold and sweep remnants
         timeout-minutes: 15
         run: |
-          # 1) Addon must be gone.
           if aws eks describe-addon --cluster-name "${{ env.CLUSTER_NAME }}" \
                --addon-name amazon-cloudwatch-observability \
                --region "${{ env.E2E_TEST_AWS_REGION }}" >/dev/null 2>&1; then
@@ -151,8 +144,6 @@ jobs:
             done
           fi
 
-          # 2) cloudwatch-agent IRSA service account must be gone, along with its eksctl CFN stack.
-          #    A surviving stack makes the next `eksctl create iamserviceaccount` behave unpredictably.
           if kubectl get sa cloudwatch-agent -n amazon-cloudwatch >/dev/null 2>&1; then
             echo "cloudwatch-agent SA still present; deleting via eksctl."
             eksctl delete iamserviceaccount --name cloudwatch-agent --namespace amazon-cloudwatch \
@@ -160,10 +151,6 @@ jobs:
               kubectl delete sa cloudwatch-agent -n amazon-cloudwatch --ignore-not-found || true
           fi
 
-          # 3) Sweep orphaned eksctl IRSA CloudFormation stacks. `eksctl delete iamserviceaccount`
-          #    normally removes both the SA and its stack, but if the SA was deleted by other means the
-          #    stack survives in CREATE_COMPLETE. Stale stacks accumulate run over run and can make the
-          #    next `eksctl create iamserviceaccount` behave unpredictably.
           orphans=$(aws cloudformation describe-stacks --region "${{ env.E2E_TEST_AWS_REGION }}" \
             --query "Stacks[?contains(StackName, 'eksctl-${{ env.CLUSTER_NAME }}-addon-iamserviceaccount-amazon-cloudwatch')].StackName" \
             --output text 2>/dev/null || true)
@@ -177,8 +164,6 @@ jobs:
             echo "No orphaned cloudwatch-agent IRSA stacks."
           fi
 
-          # 4) Report final state. Namespaces wedged in Terminating are surfaced but not fatal --
-          #    failing here would mask the pipeline's real test results.
           echo "=== Final cluster state ==="
           echo "addons:     $(aws eks list-addons --cluster-name ${{ env.CLUSTER_NAME }} --region ${{ env.E2E_TEST_AWS_REGION }} --query 'addons' --output text 2>/dev/null || echo '<none>')"
           echo "cw SAs:     $(kubectl get sa -n amazon-cloudwatch --no-headers 2>/dev/null | awk '{print $1}' | tr '\n' ' ' || echo '<none>')"

@@ -2,10 +2,6 @@
 ## SPDX-License-Identifier: Apache-2.0
 
 # Start-of-pipeline setup of Application Signals on a shared EKS test cluster.
-#
-# This is the mirror image of eks-cleanup-app-signals.yml. The caller invokes this FIRST, and gates
-# every EKS test job on it, so that installing the shared amazon-cloudwatch-observability addon and
-# the cloudwatch-agent IRSA service account happens EXACTLY ONCE while nothing else uses the cluster.
 name: EKS Setup Application Signals
 
 on:
@@ -28,7 +24,6 @@ env:
   CLUSTER_NAME: ${{ inputs.test-cluster-name }}
   E2E_TEST_ACCOUNT_ID: ${{ secrets.APPLICATION_SIGNALS_E2E_TEST_ACCOUNT_ID }}
   E2E_TEST_ROLE_NAME: ${{ secrets.APPLICATION_SIGNALS_E2E_TEST_ROLE_NAME }}
-  LOG_GROUP_NAME: /aws/application-signals/data
 
 jobs:
   eks-setup:
@@ -42,22 +37,15 @@ jobs:
           ref: 'python-eks-parallel-pipeline'
           fetch-depth: 0
 
+      # Operate on the cluster as E2E_TEST_ACCOUNT_ID, matching python-eks-parallel-test.yml and
+      # eks-cleanup-app-signals.yml. The sequential python-eks-test.yml only hops to the per-region
+      # ACCOUNT_ID role in the canary (framework-repo) case; for our caller it stays on this role, so
+      # setup must too — otherwise setup installs shared state as a different principal than the test
+      # jobs use it, which can mismatch the cluster's access entries.
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@a03048d87541d1d9fcf2ecf528a4a65ba9bd7838 # v5.0.0
         with:
           role-to-assume: arn:aws:iam::${{ env.E2E_TEST_ACCOUNT_ID }}:role/${{ env.E2E_TEST_ROLE_NAME }}
-          aws-region: ${{ env.E2E_TEST_AWS_REGION }}
-
-      - name: Retrieve account
-        uses: aws-actions/aws-secretsmanager-get-secrets@v2
-        with:
-          secret-ids: |
-            ACCOUNT_ID, region-account/${{ env.E2E_TEST_AWS_REGION }}
-
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@a03048d87541d1d9fcf2ecf528a4a65ba9bd7838 # v5.0.0
-        with:
-          role-to-assume: arn:aws:iam::${{ env.ACCOUNT_ID }}:role/${{ env.E2E_TEST_ROLE_NAME }}
           aws-region: ${{ env.E2E_TEST_AWS_REGION }}
 
       - name: Download enablement script
@@ -66,14 +54,10 @@ jobs:
           wget -q https://raw.githubusercontent.com/aws-observability/application-signals-demo/main/scripts/eks/appsignals/enable-app-signals.sh
           chmod +x enable-app-signals.sh
 
-      - name: Show enablement script version info
-        working-directory: enablement-script
-        run: grep -n "read -p" enable-app-signals.sh || echo "No interactive prompt in this revision."
 
       - name: Set up kubeconfig
         run: aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.E2E_TEST_AWS_REGION }}
 
-      # enable-app-signals.sh calls `eksctl create iamserviceaccount`, so eksctl must be on PATH.
       - name: Install eksctl
         run: |
           curl -sLO "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz"
@@ -81,7 +65,6 @@ jobs:
           rm -f eksctl_Linux_amd64.tar.gz
           eksctl version
 
-      # Reap leftovers from a PREVIOUS run before establishing shared state.
       - name: Reap leftovers from previous runs
         timeout-minutes: 10
         run: |
@@ -116,8 +99,6 @@ jobs:
             done
           fi
 
-      # Retries are implemented inline rather than sourcing .github/workflows/util/execute_and_retry.sh
-      # so this job does not depend on the framework repo being the checked-out workspace.
       - name: Install Application Signals (addon + cloudwatch-agent IRSA)
         working-directory: enablement-script
         run: |
@@ -161,14 +142,9 @@ jobs:
 
       - name: Verify cloudwatch-agent has IRSA credentials projected
         run: |
-          # Tolerate failure here: on a freshly created addon the DaemonSet may not exist yet. The
-          # retry loop below is the real gate, so don't abort the job on a transient rollout error.
           kubectl rollout status daemonset/cloudwatch-agent -n amazon-cloudwatch --timeout=300s || true
 
           for attempt in 1 2 3 4 5 6; do
-            # Require POSITIVE proof: at least one pod, all carrying AWS_ROLE_ARN. Testing only for
-            # "nothing missing" passes vacuously when kubectl errors or zero pods exist -- which would
-            # skip the repair below and hand a credential-less agent to every downstream test job.
             pods=$(kubectl get pods -n amazon-cloudwatch -l app.kubernetes.io/name=cloudwatch-agent \
               -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.spec.containers[0].env[?(@.name=="AWS_ROLE_ARN")].value}{"\n"}{end}' 2>/dev/null) || pods=""
             pods=$(printf '%s\n' "$pods" | grep -v '^[[:space:]]*$' || true)
